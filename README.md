@@ -76,7 +76,8 @@ export SLIME_DIR=/workspace/slime
 ```bash
 cd /workspace/slime-noise-rl
 pip install -e '.[dev,alfworld,tracking]'
-export PYTHONPATH="/workspace/Megatron-LM${PYTHONPATH:+:${PYTHONPATH}}"
+# 可选：未对当前 Python 做 editable 安装时，告诉项目 Megatron-LM 源码位置。
+export MEGATRON_LM_DIR=/workspace/Megatron-LM
 ```
 
 `tracking` 只增加 SwanLab SDK，不替换 Slime 的 GPU 依赖。不使用 SwanLab 时可以省略该 extra。
@@ -89,6 +90,7 @@ export PYTHONPATH="/workspace/Megatron-LM${PYTHONPATH:+:${PYTHONPATH}}"
 
 ```bash
 export SLIME_DIR=/workspace/slime
+export MEGATRON_LM_DIR=/workspace/Megatron-LM
 export HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507
 export MEGATRON_CHECKPOINT=/models/Qwen3-4B-Instruct-2507_torch_dist
 export ALFWORLD_ROOT=/datasets/alfworld/json_2.1.1

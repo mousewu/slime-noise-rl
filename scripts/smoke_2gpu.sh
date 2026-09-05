@@ -7,6 +7,7 @@ set -euo pipefail
 
 TASK_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TASK_PYTHON_BIN="${PYTHON_BIN:-python}"
+TASK_MEGATRON_LM_DIR="${MEGATRON_LM_DIR:-}"
 : "${SLIME_DIR:?Set SLIME_DIR to a clean Slime checkout}"
 : "${HF_CHECKPOINT:?Set HF_CHECKPOINT to the local Qwen3-4B-Instruct-2507 directory}"
 : "${ALFWORLD_ROOT:?Set ALFWORLD_ROOT to the local ALFWorld json_2.1.1 directory}"
@@ -35,6 +36,14 @@ if [[ ! -d "${SLIME_DIR}" ]]; then
 fi
 SLIME_DIR="$(cd -- "${SLIME_DIR}" && pwd)"
 export SLIME_DIR
+if [[ -n "${TASK_MEGATRON_LM_DIR}" ]]; then
+  if [[ ! -d "${TASK_MEGATRON_LM_DIR}/megatron/training" ]]; then
+    echo "MEGATRON_LM_DIR must contain megatron/training: ${TASK_MEGATRON_LM_DIR}" >&2
+    exit 2
+  fi
+  TASK_MEGATRON_LM_DIR="$(cd -- "${TASK_MEGATRON_LM_DIR}" && pwd)"
+  export MEGATRON_LM_DIR="${TASK_MEGATRON_LM_DIR}"
+fi
 if [[ ! -d "${TASK_HF_CHECKPOINT}" ]]; then
   echo "HF_CHECKPOINT is not a local directory: ${TASK_HF_CHECKPOINT}" >&2
   exit 2
@@ -55,7 +64,7 @@ export ALFWORLD_DATA="${ALFWORLD_DATA:-$(dirname -- "${TASK_ALFWORLD_ROOT}")}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
-export PYTHONPATH="${TASK_PROJECT_DIR}/src:${SLIME_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${TASK_MEGATRON_LM_DIR:+${TASK_MEGATRON_LM_DIR}:}${TASK_PROJECT_DIR}/src:${SLIME_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 echo "[1/7] Installing project runtime dependencies (Slime and GPU packages are left untouched)"
 "${TASK_PYTHON_BIN}" -m pip --version >/dev/null
@@ -72,7 +81,7 @@ from noise_rl.launch import verify_slime
 
 verify_slime(sys.argv[1])
 missing = []
-for package in ("torch", "ray", "sglang", "megatron.core", "transformer_engine", "flashinfer"):
+for package in ("torch", "ray", "sglang", "megatron.core", "megatron.training", "transformer_engine", "flashinfer"):
     try:
         importlib.import_module(package)
     except ImportError:

@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 TASK_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
-export PYTHONPATH="${TASK_PROJECT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+TASK_PYTHON_BIN="${PYTHON_BIN:-python}"
+TASK_MEGATRON_LM_DIR="${MEGATRON_LM_DIR:-}"
+if [[ -n "${TASK_MEGATRON_LM_DIR}" ]]; then
+  if [[ ! -d "${TASK_MEGATRON_LM_DIR}/megatron/training" ]]; then
+    echo "MEGATRON_LM_DIR must contain megatron/training: ${TASK_MEGATRON_LM_DIR}" >&2
+    exit 2
+  fi
+  TASK_MEGATRON_LM_DIR="$(cd -- "${TASK_MEGATRON_LM_DIR}" && pwd)"
+  export MEGATRON_LM_DIR="${TASK_MEGATRON_LM_DIR}"
+fi
+export PYTHONPATH="${TASK_MEGATRON_LM_DIR:+${TASK_MEGATRON_LM_DIR}:}${TASK_PROJECT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
-exec python -m noise_rl.launch "$@"
+exec "${TASK_PYTHON_BIN}" -m noise_rl.launch "$@"

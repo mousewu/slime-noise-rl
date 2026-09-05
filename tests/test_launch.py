@@ -1,12 +1,19 @@
 import os
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from noise_rl.config import ExperimentConfig
-from noise_rl.launch import build_command, swanlab_metadata, swanlab_runtime_config, verify_slime
+from noise_rl.launch import (
+    build_command,
+    configure_megatron_lm_path,
+    swanlab_metadata,
+    swanlab_runtime_config,
+    verify_slime,
+)
 
 
 def options(tmp_path):
@@ -58,6 +65,20 @@ def test_verify_slime_accepts_any_clean_commit_and_records_head(tmp_path):
     (slime / "train.py").write_text("print('modified')\n", encoding="utf-8")
     with pytest.raises(ValueError, match="modified"):
         verify_slime(slime)
+
+
+def test_configure_megatron_lm_path_prepends_source_tree(tmp_path, monkeypatch):
+    megatron = tmp_path / "Megatron-LM"
+    (megatron / "megatron" / "training").mkdir(parents=True)
+    monkeypatch.setenv("MEGATRON_LM_DIR", str(megatron))
+    monkeypatch.setenv("PYTHONPATH", "/existing/path")
+    original_sys_path = list(sys.path)
+    try:
+        assert configure_megatron_lm_path() == str(megatron.resolve())
+        assert os.environ["PYTHONPATH"].split(os.pathsep)[0] == str(megatron.resolve())
+        assert sys.path[0] == str(megatron.resolve())
+    finally:
+        sys.path[:] = original_sys_path
 
 
 @pytest.mark.integration

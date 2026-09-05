@@ -51,7 +51,15 @@ def validate_local_checkpoints(hf_checkpoint, megatron_checkpoint):
 
 def check_gpu_runtime(hf_checkpoint, megatron_checkpoint, gpus):
     validate_local_checkpoints(hf_checkpoint, megatron_checkpoint)
-    for name in ("torch", "ray", "sglang", "megatron.core", "transformer_engine", "flashinfer"):
+    for name in (
+        "torch",
+        "ray",
+        "sglang",
+        "megatron.core",
+        "megatron.training",
+        "transformer_engine",
+        "flashinfer",
+    ):
         try:
             importlib.import_module(name)
         except ImportError as exc:

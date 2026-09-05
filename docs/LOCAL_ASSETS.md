@@ -9,6 +9,8 @@
 1. Hugging Face checkpoint：供 tokenizer 和 SGLang rollout 使用。
 2. Megatron torch-dist checkpoint：供 Slime 训练 actor/reference 权重使用。
 
+训练还需要完整的 Megatron-LM Python 源码。若它没有通过 `pip install -e .` 安装到当前 Python 环境，在配置文件中设置 `MEGATRON_LM_DIR=/path/to/Megatron-LM`；项目会将该目录前置加入 `PYTHONPATH`，并在第 2 步验证 `megatron.training` 可导入。
+
 Hugging Face 目录至少应包含：
 
 ```text

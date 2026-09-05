@@ -66,6 +66,24 @@ def verify_slime(slime_dir):
     return actual
 
 
+def configure_megatron_lm_path():
+    """Prepend an explicitly supplied Megatron-LM source tree to import paths."""
+    configured = os.environ.get("MEGATRON_LM_DIR")
+    if not configured:
+        return None
+    path = Path(configured).expanduser().resolve(strict=True)
+    if not (path / "megatron" / "training").is_dir():
+        raise FileNotFoundError(f"MEGATRON_LM_DIR must contain megatron/training: {path}")
+    value = str(path)
+    if value not in sys.path:
+        sys.path.insert(0, value)
+    entries = os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    if not entries or entries[0] != value:
+        os.environ["PYTHONPATH"] = os.pathsep.join([value, *filter(None, entries)])
+    os.environ["MEGATRON_LM_DIR"] = value
+    return value
+
+
 def model_arguments(slime_dir):
     script = Path(slime_dir) / "scripts/models/qwen3-4B-Instruct-2507.sh"
     # Positional arguments, never interpolate paths into shell source code.
@@ -235,6 +253,7 @@ def build_command(args, config):
 
 
 def main(argv=None):
+    megatron_lm_dir = configure_megatron_lm_path()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--slime-dir", default=os.environ.get("SLIME_DIR"), required=not os.environ.get("SLIME_DIR")
@@ -363,13 +382,17 @@ def main(argv=None):
         atomic_json(output / "run.json", metadata)
         atomic_json(output / "runtime_config.json", {"noise_rl": config.to_dict()})
     env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH", "").split(os.pathsep)
+    if megatron_lm_dir:
+        existing_pythonpath = [item for item in existing_pythonpath if item != megatron_lm_dir]
     env["PYTHONPATH"] = os.pathsep.join(
         filter(
             None,
             [
+                megatron_lm_dir,
                 str(Path(__file__).resolve().parents[1]),
                 str(Path(args.slime_dir).resolve()),
-                env.get("PYTHONPATH"),
+                *existing_pythonpath,
             ],
         )
     )

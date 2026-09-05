@@ -12,6 +12,8 @@ def test_two_gpu_smoke_script_and_short_budget_config():
     text = script.read_text(encoding="utf-8")
     for fragment in (
         '"${TASK_PROJECT_DIR}[alfworld,tracking]"',
+        "MEGATRON_LM_DIR",
+        "megatron.training",
         ': "${HF_CHECKPOINT:',
         ': "${ALFWORLD_ROOT:',
         "HF_HUB_OFFLINE=1",

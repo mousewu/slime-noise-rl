@@ -12,6 +12,9 @@ def test_two_gpu_smoke_script_and_short_budget_config():
     text = script.read_text(encoding="utf-8")
     for fragment in (
         '"${TASK_PROJECT_DIR}[alfworld,tracking]"',
+        ': "${HF_CHECKPOINT:',
+        ': "${ALFWORLD_ROOT:',
+        "HF_HUB_OFFLINE=1",
         "--gpus 2",
         "--tensor-parallel 2",
         "--engine-gpus 2",
@@ -20,6 +23,9 @@ def test_two_gpu_smoke_script_and_short_budget_config():
     ):
         assert fragment in text
     assert "pip install slime" not in text.lower()
+    assert "hf download" not in text.lower()
+    assert "alfworld-download" not in text.lower()
+    assert "auto_download" not in text.lower()
     assert "rm -rf" not in text
 
     config = load_config(ROOT / "configs/smoke_2gpu.yaml")

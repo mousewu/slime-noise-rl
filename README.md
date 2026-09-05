@@ -85,24 +85,25 @@ export PYTHONPATH="/workspace/Megatron-LM${PYTHONPATH:+:${PYTHONPATH}}"
 
 ### 两张GPU一键试跑
 
-如果已经按照 Slime 文档配置好 CUDA、SGLang、Megatron、Ray 和一个干净的固定版本 Slime checkout，可以用下面的脚本完成其余依赖安装、模型和 ALFWorld 数据下载、权重转换、dry-run 以及两轮短程在线 RL：
+如果已经按照 Slime 文档配置好 CUDA、SGLang、Megatron、Ray 和一个干净的固定版本 Slime checkout，可以用下面的脚本完成其余依赖安装、本地资源校验、必要的本地权重转换、dry-run 以及两轮短程在线 RL。脚本不会下载模型或任务数据：
 
 ```bash
 export SLIME_DIR=/workspace/slime
+export HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507
+export MEGATRON_CHECKPOINT=/models/Qwen3-4B-Instruct-2507_torch_dist
+export ALFWORLD_ROOT=/datasets/alfworld/json_2.1.1
 bash scripts/smoke_2gpu.sh
 ```
 
 脚本默认只暴露 GPU 0、1，使用 `configs/smoke_2gpu.yaml`：训练 TP=2、一个双卡 rollout engine、每任务4条轨迹、最多8个模型回合，并执行2个完整 rollout（包含反向传播和checkpoint保存）。这是管线验证配置，不能作为论文主结果。
 
-默认会把资源放在 `runs/_smoke_assets/`，自动下载 Qwen3-4B 和 ALFWorld，并使用离线 SwanLab。常用覆盖方式：
+`HF_CHECKPOINT` 和 `ALFWORLD_ROOT` 必须指向已有本地目录。`MEGATRON_CHECKPOINT` 未设置时默认为 `${HF_CHECKPOINT}_torch_dist`；若不存在，脚本只从本地 HF checkpoint 转换。默认使用离线 SwanLab。常用方式：
 
 ```bash
-# 使用已有资源且禁止下载
-SLIME_DIR=/workspace/slime \
-HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507 \
-MEGATRON_CHECKPOINT=/models/Qwen3-4B-Instruct-2507_torch_dist \
-ALFWORLD_ROOT=/datasets/alfworld/json_2.1.1 \
-AUTO_DOWNLOAD=0 \
+# 也可以把本地路径保存在不会提交的配置文件中
+cp configs/local_paths.env.example configs/local_paths.env
+# 编辑路径后：
+source configs/local_paths.env
 bash scripts/smoke_2gpu.sh
 
 # 只验证在线rollout，不反向传播
@@ -116,20 +117,19 @@ SLIME_DIR=/workspace/slime SWANLAB_MODE=online bash scripts/smoke_2gpu.sh
 
 ### 模型和初始化权重
 
+项目不提供模型下载逻辑。已有 HF checkpoint 可按下面方式转换；转换脚本拒绝已经存在的输出路径，训练脚本不会执行 `pkill`、`ray stop` 或清空 checkpoint：
+
 ```bash
-hf download Qwen/Qwen3-4B-Instruct-2507 --local-dir /models/Qwen3-4B-Instruct-2507
 bash scripts/convert_checkpoint.sh \
   /models/Qwen3-4B-Instruct-2507 \
   /models/Qwen3-4B-Instruct-2507_torch_dist
 ```
 
-转换脚本拒绝已经存在的输出路径；训练脚本不会执行 `pkill`、`ray stop` 或清空 checkpoint。
-
 ### ALFWorld 任务清单
 
+本项目只需要 ALFWorld 的 `traj_data.json` 和 `game.tw-pddl` 文本游戏。手工准备好本地数据后生成 manifest：
+
 ```bash
-export ALFWORLD_DATA=/datasets/alfworld
-alfworld-download
 noise-rl prepare --environment alfworld \
   --root /datasets/alfworld/json_2.1.1 --split train \
   --output data/alfworld/train.jsonl
@@ -138,7 +138,7 @@ noise-rl prepare --environment alfworld \
   --output data/alfworld/valid_unseen.jsonl
 ```
 
-任务清单记录绝对游戏路径、官方 split、任务类型及游戏 SHA256。请在最终训练服务器上生成；更换数据位置应重新生成清单。读取时保留官方 solvable 筛选及 movable/sliced 排除规则。下载工具可能也获取视觉相关资产，但本项目只使用文本/PDDL 环境。
+任务清单记录绝对游戏路径、官方 split、任务类型及游戏 SHA256。请在最终训练服务器上生成；更换数据位置应重新生成清单。读取时保留官方 solvable 筛选及 movable/sliced 排除规则。所需压缩包、目录结构和无需下载的视觉/预训练资源见 [本地模型与数据配置](docs/LOCAL_ASSETS.md)。
 
 `--limit 128` 可用于小规模预实验，按固定hash选择任务，避免只取字典序最前的一种任务类型；正式实验应记录任务分布。清单生成拒绝覆盖已有文件。`valid_seen`、`valid_unseen` 不允许作为训练清单。
 

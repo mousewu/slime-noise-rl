@@ -12,7 +12,8 @@ from pathlib import Path
 
 from . import SLIME_COMMIT
 from .config import load_config
-from .data import atomic_json, read_records
+from .data import atomic_json, read_records, validate_local_records
+from .preflight import validate_local_checkpoints
 from .swanlab_bridge import SWANLAB_CONFIG_ENV
 
 _TRACKING_OPTIONS = {
@@ -296,11 +297,14 @@ def main(argv=None):
     if args.max_tokens_per_gpu < config.max_context_tokens:
         raise ValueError("max-tokens-per-gpu must accommodate one full trajectory context")
     verify_slime(args.slime_dir)
+    validate_local_checkpoints(args.hf_checkpoint, args.megatron_checkpoint)
     training = read_records(args.data)
+    validate_local_records(training)
     if any(r["metadata"]["task"].get("split") != "train" for r in training):
         raise ValueError("Training tasks must be from split=train")
     if args.eval_data:
         evaluation = read_records(args.eval_data)
+        validate_local_records(evaluation)
         ids = {r["metadata"]["task"]["id"] for r in training}
         if any(
             r["metadata"]["task"].get("split") == "train" or r["metadata"]["task"]["id"] in ids
@@ -372,6 +376,7 @@ def main(argv=None):
     env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     env.setdefault("NVTE_FUSED_ATTN", "0")
     env.setdefault("NVTE_FLASH_ATTN", "1")
+    env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
     if args.deterministic:
         env.update(NCCL_ALGO="Ring", NVTE_ALLOW_NONDETERMINISTIC_ALGO="0", CUBLAS_WORKSPACE_CONFIG=":4096:8")
     if tracking:

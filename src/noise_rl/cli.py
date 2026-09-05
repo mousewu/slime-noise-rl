@@ -1,13 +1,21 @@
 import argparse
 import asyncio
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 
 from .advantages import group_advantages
 from .agent import SGLangClient, run_episode
 from .config import ExperimentConfig, NoiseConfig, load_config
-from .data import alfworld_records, atomic_json, mini_records, read_records, write_records
+from .data import (
+    alfworld_records,
+    atomic_json,
+    mini_records,
+    read_records,
+    validate_local_records,
+    write_records,
+)
 from .fixtures import ByteTokenizer, ScriptedClient
 from .metrics import balanced_variance_components, episode_record, paired_comparison, summarize
 from .sampling import plan_sample
@@ -22,9 +30,20 @@ def load_episode_records(path):
         return [json.loads(line) for line in stream if line.strip()]
 
 
-async def run_evaluation(args):
+def load_local_tokenizer(model):
+    """Load a tokenizer from an explicit local directory with hub access disabled."""
+    model_path = Path(model).expanduser().resolve(strict=True)
+    if not model_path.is_dir():
+        raise NotADirectoryError(f"Model/tokenizer path must be a local directory: {model_path}")
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_DATASETS_OFFLINE"] = "1"
     from transformers import AutoTokenizer
 
+    return AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=False, local_files_only=True)
+
+
+async def run_evaluation(args):
     if Path(args.output).exists():
         raise FileExistsError("Evaluation output exists; choose a new file before starting inference")
     config = load_config(args.config)
@@ -34,7 +53,8 @@ async def run_evaluation(args):
     records = read_records(args.data)
     if any(r["metadata"]["task"].get("split") == "train" for r in records):
         raise ValueError("Use a held-out manifest for evaluation")
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
+    validate_local_records(records)
+    tokenizer = load_local_tokenizer(args.model)
     client = SGLangClient(args.url, config.request_timeout)
     semaphore = asyncio.Semaphore(config.concurrency)
 
@@ -90,8 +110,6 @@ async def run_demo(args):
 
 async def run_probe(args):
     """Frozen-policy nested sampling. Reports outcome variance, NOT gradient variance."""
-    from transformers import AutoTokenizer
-
     if Path(args.output).exists():
         raise FileExistsError(args.output)
     config = replace(
@@ -101,8 +119,9 @@ async def run_probe(args):
         group_size=args.scenarios * args.policy_samples,
         seed=args.seed,
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
     records = read_records(args.data)[: args.tasks]
+    validate_local_records(records)
+    tokenizer = load_local_tokenizer(args.model)
     client = SGLangClient(args.url, config.request_timeout)
     semaphore = asyncio.Semaphore(config.concurrency)
 

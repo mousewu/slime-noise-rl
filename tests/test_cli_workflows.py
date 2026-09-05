@@ -15,10 +15,17 @@ from noise_rl.fixtures import ByteTokenizer
 def fixture_server(monkeypatch):
     transformers = pytest.importorskip("transformers")
     tokenizer = ByteTokenizer()
-    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **k: tokenizer)
+    tokenizer_calls = []
+
+    def load_tokenizer(*args, **kwargs):
+        tokenizer_calls.append((args, kwargs))
+        return tokenizer
+
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", load_tokenizer)
 
     class Client:
         closed = 0
+        local_tokenizer_calls = tokenizer_calls
 
         def __init__(self, *args):
             pass
@@ -47,10 +54,12 @@ def inputs(tmp_path):
     data = tmp_path / "eval.jsonl"
     atomic_json(cfg, {"noise_rl": ExperimentConfig(noise=NoiseConfig(0, 0)).to_dict()})
     write_records(data, mini_records(1, "valid_unseen"))
+    model = tmp_path / "model"
+    model.mkdir()
     return SimpleNamespace(
         config=str(cfg),
         data=str(data),
-        model="fixture",
+        model=str(model),
         url="http://fixture",
         seed=123,
         output=str(tmp_path / "result.jsonl"),
@@ -71,6 +80,9 @@ def test_standalone_evaluation_workflow(tmp_path, fixture_server):
     assert all(r["plan"]["evaluation"] for r in rows)
     assert len({r["plan"]["environment_seed"] for r in rows}) == 2
     assert fixture_server.closed == 1
+    _, kwargs = fixture_server.local_tokenizer_calls[-1]
+    assert kwargs["local_files_only"] is True
+    assert kwargs["trust_remote_code"] is False
     with pytest.raises(FileExistsError):
         asyncio.run(cli.run_evaluation(args))
 
@@ -86,3 +98,4 @@ def test_frozen_policy_probe_workflow(tmp_path, fixture_server):
     assert len({r["plan"]["policy_seed"] for r in rows}) == 6
     assert all(r["phase"] == "frozen_policy_probe" for r in rows)
     assert fixture_server.closed == 1
+    assert fixture_server.local_tokenizer_calls[-1][1]["local_files_only"] is True

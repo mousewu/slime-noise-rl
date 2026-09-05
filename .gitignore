@@ -9,3 +9,4 @@ runs/
 checkpoints/
 third_party/
 *.log
+configs/local_paths.env

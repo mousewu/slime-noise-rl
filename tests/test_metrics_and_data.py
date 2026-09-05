@@ -1,8 +1,10 @@
 import copy
+import hashlib
+import json
 
 import pytest
 
-from noise_rl.data import mini_records, read_records, write_records
+from noise_rl.data import mini_records, read_records, validate_local_records, write_records
 from noise_rl.metrics import balanced_variance_components, paired_comparison, summarize
 
 
@@ -21,6 +23,30 @@ def test_manifest_duplicate_ids_rejected(tmp_path):
     write_records(path, [row, row])
     with pytest.raises(ValueError, match="unique"):
         read_records(path)
+
+
+def test_local_alfworld_manifest_assets_are_verified(tmp_path):
+    game = tmp_path / "game.tw-pddl"
+    game.write_text(json.dumps({"solvable": True}), encoding="utf-8")
+    digest = hashlib.sha256(game.read_bytes()).hexdigest()
+    rows = [
+        {
+            "prompt": "Complete the household task.",
+            "metadata": {
+                "task": {
+                    "id": "alfworld/train/example",
+                    "environment": "alfworld",
+                    "split": "train",
+                    "gamefile": str(game),
+                    "game_sha256": digest,
+                }
+            },
+        }
+    ]
+    validate_local_records(rows)
+    game.write_text("changed", encoding="utf-8")
+    with pytest.raises(ValueError, match="changed"):
+        validate_local_records(rows)
 
 
 def test_variance_components_distinguish_fixed_environment_effects():

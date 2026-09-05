@@ -49,6 +49,25 @@ def read_records(path: str | Path) -> list[dict]:
     return records
 
 
+def validate_local_records(records: list[dict]):
+    """Verify every environment asset referenced by a manifest is local and unchanged."""
+    checked = set()
+    for record in records:
+        task = record["metadata"]["task"]
+        if task["environment"] != "alfworld":
+            continue
+        game = Path(task["gamefile"]).expanduser()
+        if not game.is_file():
+            raise FileNotFoundError(f"Manifest references a missing local ALFWorld game: {game}")
+        resolved = game.resolve()
+        if resolved in checked:
+            continue
+        expected = task.get("game_sha256")
+        if expected and hashlib.sha256(resolved.read_bytes()).hexdigest() != expected:
+            raise ValueError(f"ALFWorld game changed since manifest creation: {resolved}")
+        checked.add(resolved)
+
+
 def write_records(path: str | Path, records: list[dict]):
     """Refuse to overwrite datasets; regenerating needs a new explicit output path."""
     path = Path(path)

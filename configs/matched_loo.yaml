@@ -1,0 +1,9 @@
+noise_rl:
+  method: matched
+  group_size: 8
+  scenarios: 2
+  baseline: loo
+  std_normalization: false
+  noise:
+    action_drop: 0.15
+    observation_loss: 0.10

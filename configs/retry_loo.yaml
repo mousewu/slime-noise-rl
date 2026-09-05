@@ -1,0 +1,10 @@
+noise_rl:
+  method: independent
+  group_size: 8
+  scenarios: 2
+  baseline: loo
+  std_normalization: false
+  retry_limit: 2
+  noise:
+    action_drop: 0.15
+    observation_loss: 0.10

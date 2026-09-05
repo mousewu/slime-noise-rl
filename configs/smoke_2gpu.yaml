@@ -1,0 +1,16 @@
+noise_rl:
+  # Plumbing-only configuration. Do not report this short-budget run as a main result.
+  method: matched
+  group_size: 4
+  scenarios: 2
+  baseline: loo
+  std_normalization: false
+  max_turns: 8
+  max_tool_calls: 12
+  max_context_tokens: 4096
+  max_generated_tokens: 512
+  max_tokens_per_turn: 64
+  concurrency: 4
+  noise:
+    action_drop: 0.15
+    observation_loss: 0.10

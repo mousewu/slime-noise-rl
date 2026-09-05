@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slime-noise-rl"
+version = "0.1.0"
+description = "Controlled stochastic-environment experiments for multi-turn RL on Slime"
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27,<1", "PyYAML>=6,<7"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
+inference = ["transformers>=4.51,<5"]
+alfworld = ["alfworld==0.4.2", "termcolor>=2", "numpy<3"]
+contract = ["torch>=2.5", "transformers>=4.51,<5"]
+tracking = ["swanlab>=0.9.6,<1"]
+
+[project.scripts]
+noise-rl = "noise_rl.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: optional tests with real upstream packages or downloaded games"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]

@@ -5,7 +5,7 @@ import json
 import pytest
 
 from noise_rl.data import mini_records, read_records, validate_local_records, write_records
-from noise_rl.metrics import balanced_variance_components, paired_comparison, summarize
+from noise_rl.metrics import balanced_variance_components, paired_comparison, summarize, trace_metrics
 
 
 def test_manifest_roundtrip_and_no_overwrite(tmp_path):
@@ -82,6 +82,29 @@ def test_task_macro_metric_and_paired_ci():
     delta = paired_comparison(left, right)
     assert delta["success_delta_right_minus_left"] == 1
     assert delta["task_paired_bootstrap_95ci"] == [1, 1]
+
+
+def test_trace_metrics_covers_rollout_costs_and_fault_rates():
+    records = [
+        {
+            "plan": {"task_id": "a"}, "success": True, "generated_tokens": 10,
+            "inference_input_tokens": 20, "context_tokens": 30, "tool_calls": 2,
+            "turns": 2, "format_errors": 0, "elapsed_seconds": 1.5,
+            "termination": "success", "fault_audit": [{"dropped": True, "observation_lost": False}],
+        },
+        {
+            "plan": {"task_id": "b"}, "success": False, "generated_tokens": 6,
+            "inference_input_tokens": 9, "context_tokens": 15, "tool_calls": 1,
+            "turns": 1, "format_errors": 1, "elapsed_seconds": 2.5,
+            "termination": "tool_budget", "fault_audit": [{"dropped": False, "observation_lost": True}],
+        },
+    ]
+    metrics = trace_metrics(records, prefix="rollout", step=7)
+    assert metrics["rollout/step"] == 7
+    assert metrics["rollout/success_rate"] == 0.5
+    assert metrics["rollout/generated_tokens/total"] == 16
+    assert metrics["rollout/faults/action_drop_rate"] == 0.5
+    assert metrics["rollout/termination/success_rate"] == 0.5
 
 
 @pytest.mark.parametrize("damage", ["seed", "conditions", "missing", "duplicate", "training"])

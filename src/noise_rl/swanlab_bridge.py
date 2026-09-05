@@ -8,10 +8,13 @@ dispatcher, and forwards scalar metrics to one project-owned logger actor.
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import math
 import os
 from numbers import Real
+from pathlib import Path
+from time import time
 from typing import Any
 
 SWANLAB_CONFIG_ENV = "NOISE_RL_SWANLAB_CONFIG"
@@ -79,6 +82,9 @@ class SwanLabLogger:
         init_options = {key: settings[key] for key in init_keys if settings.get(key) is not None}
         init_options["config"] = settings.get("config", {})
         self._run = swanlab.init(**init_options)
+        self._audit_path = Path(init_options["logdir"]) / "metric_events.jsonl"
+        self._audit_path.parent.mkdir(parents=True, exist_ok=True)
+        self._event_index = 0
 
     def ready(self) -> dict[str, str | None]:
         return {"id": getattr(self._run, "id", None)}
@@ -90,6 +96,10 @@ class SwanLabLogger:
         # Slime has independent train/rollout/eval counters. SwanLab has one
         # global step, so let its SDK maintain that counter (including across
         # resume) and retain Slime's native counters in the logged values.
+        self._event_index += 1
+        event = {"event": self._event_index, "time": time(), "metrics": values}
+        with self._audit_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, sort_keys=True, allow_nan=False) + "\n")
         self._swanlab.log(values)
 
     def finish(self) -> None:
@@ -108,21 +118,30 @@ def _logger_actor():
     return _LOGGER_ACTOR
 
 
-def _forward(metrics: dict[str, Any]) -> None:
+def _forward(metrics: dict[str, Any]) -> bool:
     global _FORWARD_WARNING_EMITTED
     values = scalar_metrics(metrics)
     if not values:
-        return
+        return False
+    if not os.environ.get(SWANLAB_ACTOR_ENV):
+        return False
     try:
         import ray
 
         ray.get(_logger_actor().log.remote(values), timeout=30)
+        return True
     except Exception:
         if not _FORWARD_WARNING_EMITTED:
             logging.getLogger(__name__).exception(
                 "SwanLab metric forwarding failed; training will continue without further warning"
             )
             _FORWARD_WARNING_EMITTED = True
+        return False
+
+
+def report_metrics(metrics: dict[str, Any]) -> bool:
+    """Forward project-owned scalar metrics when SwanLab tracking is enabled."""
+    return _forward(metrics)
 
 
 def install_slime_logging_patch() -> None:

@@ -8,8 +8,9 @@ from .advantages import group_advantages
 from .agent import SGLangClient, run_episode
 from .config import NoiseConfig, config_from_args
 from .data import atomic_json, read_records
-from .metrics import episode_record, summarize
+from .metrics import episode_record, summarize, trace_metrics
 from .sampling import SamplingPlan, plan_sample
+from .swanlab_bridge import report_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,23 @@ def reward_postprocess(args, samples):
         raise ValueError("Do not drop individual members of a comparison group")
     normalized, statistics = group_advantages(rewards, plans, config)
     logger.info("noise_rl advantages: %s", statistics)
+    records = [sample.metadata.get("noise_result") for sample in samples]
+    if all(isinstance(record, dict) for record in records):
+        rollout_id = max(plan.group_id for plan in plans)
+        metrics = trace_metrics(records, prefix="rollout", step=rollout_id)
+        metrics.update(
+            {
+                "rollout/reward/mean": sum(rewards) / len(rewards),
+                "rollout/reward/total": sum(rewards),
+                "rollout/advantages/mean": sum(normalized) / len(normalized),
+                "rollout/advantages/abs_mean": sum(abs(value) for value in normalized) / len(normalized),
+                "rollout/groups": len({plan.group_id for plan in plans}),
+            }
+        )
+        logger.info("noise_rl rollout_metrics: %s", metrics)
+        report_metrics(metrics)
+        if config.trace_dir:
+            atomic_json(Path(config.trace_dir) / "metrics" / f"rollout_{rollout_id}.json", metrics)
     if config.trace_dir:
         atomic_json(
             Path(config.trace_dir) / "advantages" / f"group_{min(p.group_id for p in plans)}.json",
@@ -170,7 +188,13 @@ def evaluate_rollout(args, rollout_id, data_source, evaluation=False):
                     tasks.append(generate_and_rm(args, sample, params, evaluation=True))
             samples = await asyncio.gather(*tasks)
             result_records = [s.metadata["noise_result"] for s in samples]
-            logger.info("noise_rl evaluation %s: %s", dataset.name, summarize(result_records))
+            summary = summarize(result_records)
+            metrics = trace_metrics(result_records, prefix=f"eval/{dataset.name}", step=rollout_id)
+            logger.info("noise_rl evaluation %s: %s", dataset.name, summary)
+            logger.info("noise_rl evaluation_metrics: %s", metrics)
+            report_metrics(metrics)
+            if config.trace_dir:
+                atomic_json(Path(config.trace_dir) / "metrics" / f"eval_{rollout_id}_{dataset.name}.json", metrics)
             output[dataset.name] = {
                 "rewards": [s.reward for s in samples],
                 "samples": samples,

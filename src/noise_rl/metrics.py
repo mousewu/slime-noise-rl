@@ -58,6 +58,54 @@ def summarize(records: list[dict]):
     }
 
 
+def trace_metrics(records: list[dict], *, prefix: str, step: int) -> dict[str, int | float]:
+    """Summarize completed trace records into finite scalar tracking metrics.
+
+    Trace files remain the detailed source of truth.  This compact view is
+    deliberately limited to scalar quantities so it can be sent safely from a
+    Ray worker to one SwanLab owner process.
+    """
+    if not records:
+        raise ValueError("No episode records")
+    if not prefix or prefix.endswith("/"):
+        raise ValueError("prefix must be a nonempty metric namespace without a trailing slash")
+
+    count = len(records)
+    faults = [event for record in records for event in record.get("fault_audit", [])]
+    terminations = Counter(str(record['termination']) for record in records)
+    metrics: dict[str, int | float] = {
+        f"{prefix}/step": step,
+        f"{prefix}/episodes": count,
+        f"{prefix}/tasks": len({record['plan']['task_id'] for record in records}),
+        f"{prefix}/success_rate": mean(float(record['success']) for record in records),
+        f"{prefix}/generated_tokens/mean": mean(record['generated_tokens'] for record in records),
+        f"{prefix}/generated_tokens/total": sum(record['generated_tokens'] for record in records),
+        f"{prefix}/inference_input_tokens/mean": mean(
+            record['inference_input_tokens'] for record in records
+        ),
+        f"{prefix}/inference_input_tokens/total": sum(
+            record['inference_input_tokens'] for record in records
+        ),
+        f"{prefix}/context_tokens/mean": mean(record['context_tokens'] for record in records),
+        f"{prefix}/tool_calls/mean": mean(record['tool_calls'] for record in records),
+        f"{prefix}/tool_calls/total": sum(record['tool_calls'] for record in records),
+        f"{prefix}/turns/mean": mean(record['turns'] for record in records),
+        f"{prefix}/format_errors/total": sum(record['format_errors'] for record in records),
+        f"{prefix}/elapsed_seconds/mean": mean(record['elapsed_seconds'] for record in records),
+        f"{prefix}/elapsed_seconds/max": max(record['elapsed_seconds'] for record in records),
+        f"{prefix}/elapsed_seconds/total": sum(record['elapsed_seconds'] for record in records),
+        f"{prefix}/faults/action_drop_rate": (
+            sum(bool(event.get("dropped")) for event in faults) / len(faults) if faults else 0.0
+        ),
+        f"{prefix}/faults/observation_loss_rate": (
+            sum(bool(event.get("observation_lost")) for event in faults) / len(faults) if faults else 0.0
+        ),
+    }
+    for termination, value in terminations.items():
+        metrics[f"{prefix}/termination/{termination}_rate"] = value / count
+    return metrics
+
+
 def paired_comparison(left: list[dict], right: list[dict]):
     def index(rows):
         result = {}

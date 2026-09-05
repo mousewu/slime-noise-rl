@@ -198,16 +198,17 @@ bash scripts/train.sh \
 
 可用 `--swanlab-mode offline` 仅保存本地记录，或者用 `--swanlab-mode local` 配合本地看板；默认日志目录是运行目录下的 `swanlab/`，可通过 `--swanlab-logdir` 改写。`SWANLAB_API_HOST` 可指定私有部署地址。
 
-接入层不修改 Slime 源码：Ray 的 worker setup hook 在每个训练进程中保留 Slime 原日志调用，并把标量指标转发给单一 SwanLab logger actor。SwanLab SDK 自动维护全局事件 step（包括断点恢复），桥接层同时保留 `train/step`、`rollout/step`、`eval/step` 等 Slime 原生计数器。`--resume` 会复用 `run.json` 中保存的 SwanLab run ID；恢复时保持 SwanLab 项目、实验名和日志目录不变。
+接入层不修改 Slime 源码：Ray 的 worker setup hook 在每个训练进程中保留 Slime 原日志调用，并把标量指标转发给单一 SwanLab logger actor。SwanLab SDK 自动维护全局事件 step（包括断点恢复），桥接层同时保留 `train/step`、`rollout/step`、`eval/step` 等 Slime 原生计数器。每个完整 rollout 还会从逐轨迹 trace 汇总并记录 `rollout/success_rate`、token、工具调用、轨迹耗时、终止原因和实际噪声触发率；评估会产生对应的 `eval/<dataset>/*` 指标。`--resume` 会复用 `run.json` 中保存的 SwanLab run ID；恢复时保持 SwanLab 项目、实验名和日志目录不变。
 
 运行目录包含：
 
 - `run.json`、`runtime_config.json`：启动命令、Slime版本、完整实验参数。
-- `swanlab/`：启用 SwanLab 时的本地SDK记录；run ID同时保存在 `run.json`。
+- `swanlab/`：启用 SwanLab 时的本地SDK记录；`metric_events.jsonl` 是所有实际提交给 SDK 的标量审计日志，run ID同时保存在 `run.json`。
 - `checkpoints/`：Slime训练checkpoint和采样计数器状态。
 - `hf/rollout_<id>/`：可用于独立部署评估的HF权重。
 - `traces/train/`、`traces/eval_<id>/`：逐轨迹动作、故障审计、token成本和成功标记。
 - `traces/advantages/`：原始奖励、分组标识和实际传给Slime的标量优势。
+- `traces/metrics/`：每个训练 rollout 与每次评估从 trace 汇总出的 SwanLab 指标副本，可用于离线复核。
 
 恢复时加 `--resume` 并保持原参数、数据和路径；可增大 `--num-rollout`。数据源状态丢失、数据内容或采样配置变化都会拒绝恢复，避免悄悄重置环境随机情景。
 

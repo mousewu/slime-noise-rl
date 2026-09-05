@@ -91,10 +91,10 @@ def test_unsafe_slime_flags_rejected(slime_args, option, value):
         validate_slime_args(slime_args)
 
 
-def test_pinned_slime_and_exact_model_rope():
+def test_slime_checkout_and_exact_model_rope():
     path = os.environ.get("SLIME_SOURCE_PATH")
     if not path:
-        pytest.skip("Set SLIME_SOURCE_PATH to a clean pinned Slime checkout")
+        pytest.skip("Set SLIME_SOURCE_PATH to a clean Slime checkout")
     verify_slime(path)
     arguments = model_arguments(path)
     assert arguments[arguments.index("--rotary-base") + 1] == "5000000"

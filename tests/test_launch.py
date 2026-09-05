@@ -1,11 +1,12 @@
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from noise_rl.config import ExperimentConfig
-from noise_rl.launch import build_command, swanlab_metadata, swanlab_runtime_config
+from noise_rl.launch import build_command, swanlab_metadata, swanlab_runtime_config, verify_slime
 
 
 def options(tmp_path):
@@ -28,6 +29,35 @@ def options(tmp_path):
         eval_interval=25,
         eval_repeats=4,
     )
+
+
+def test_verify_slime_accepts_any_clean_commit_and_records_head(tmp_path):
+    slime = tmp_path / "slime"
+    slime.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=slime, check=True, capture_output=True)
+    (slime / "train.py").write_text("print('fixture')\n", encoding="utf-8")
+    subprocess.run(["git", "add", "train.py"], cwd=slime, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+        cwd=slime,
+        check=True,
+        capture_output=True,
+    )
+    expected = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=slime, text=True).strip()
+    assert verify_slime(slime) == expected
+
+    (slime / "train.py").write_text("print('modified')\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="modified"):
+        verify_slime(slime)
 
 
 @pytest.mark.integration

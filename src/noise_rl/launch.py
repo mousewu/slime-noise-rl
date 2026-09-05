@@ -10,7 +10,6 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 
-from . import SLIME_COMMIT
 from .config import load_config
 from .data import atomic_json, read_records, validate_local_records
 from .preflight import validate_local_checkpoints
@@ -54,15 +53,16 @@ def swanlab_runtime_config(tracking: dict, experiment: dict) -> dict:
 
 
 def verify_slime(slime_dir):
+    slime_dir = Path(slime_dir).expanduser().resolve(strict=True)
+    if not (slime_dir / "train.py").is_file():
+        raise FileNotFoundError(f"Slime train.py was not found in {slime_dir}")
     actual = subprocess.check_output(["git", "-C", str(slime_dir), "rev-parse", "HEAD"], text=True).strip()
-    if actual != SLIME_COMMIT:
-        raise ValueError(f"Expected Slime {SLIME_COMMIT}, found {actual}; port and re-test before updating")
     # Untracked files are allowed; modified tracked source is not a verified dependency.
     dirty = subprocess.check_output(
         ["git", "-C", str(slime_dir), "status", "--porcelain", "--untracked-files=no"], text=True
     ).strip()
     if dirty:
-        raise ValueError("Slime tracked source is modified; use a clean pinned checkout")
+        raise ValueError("Slime tracked source is modified; use a clean checkout")
     return actual
 
 
@@ -296,7 +296,7 @@ def main(argv=None):
     )
     if args.max_tokens_per_gpu < config.max_context_tokens:
         raise ValueError("max-tokens-per-gpu must accommodate one full trajectory context")
-    verify_slime(args.slime_dir)
+    slime_commit = verify_slime(args.slime_dir)
     validate_local_checkpoints(args.hf_checkpoint, args.megatron_checkpoint)
     training = read_records(args.data)
     validate_local_records(training)
@@ -336,7 +336,7 @@ def main(argv=None):
         if previous_tracking and tracking != previous_tracking:
             raise ValueError("Cannot resume with different SwanLab project, experiment, or storage settings")
     metadata = {
-        "slime_commit": SLIME_COMMIT,
+        "slime_commit": slime_commit,
         "config": config.to_dict(),
         "command": command,
         "training_options": invariants,
@@ -348,7 +348,7 @@ def main(argv=None):
     if args.resume:
         if (
             old["config"] != metadata["config"]
-            or old["slime_commit"] != SLIME_COMMIT
+            or old["slime_commit"] != slime_commit
             or old.get("training_options") != invariants
         ):
             raise ValueError("Cannot resume with a different configuration or Slime version")
@@ -381,7 +381,7 @@ def main(argv=None):
         env.update(NCCL_ALGO="Ring", NVTE_ALLOW_NONDETERMINISTIC_ALGO="0", CUBLAS_WORKSPACE_CONFIG=":4096:8")
     if tracking:
         experiment = {
-            "slime_commit": SLIME_COMMIT,
+            "slime_commit": slime_commit,
             "noise_rl": config.to_dict(),
             "training": invariants,
         }

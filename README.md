@@ -6,7 +6,7 @@
 
 ## 1. 兼容版本和已验证范围
 
-- Slime：固定到 [`4c193f1f37509cca70f0e88807a9305b70f63f4e`](https://github.com/THUDM/slime/tree/4c193f1f37509cca70f0e88807a9305b70f63f4e)。不修改其源码；启动时检查版本和 tracked 文件修改。
+- Slime：最初针对 [`4c193f1f37509cca70f0e88807a9305b70f63f4e`](https://github.com/THUDM/slime/tree/4c193f1f37509cca70f0e88807a9305b70f63f4e) 完成接口验证，但启动时不限制 commit。运行记录会保存实际 HEAD，并拒绝 tracked 文件有本地修改的 checkout；更换版本后应重新执行接口与两卡训练验证。
 - 模型：`Qwen/Qwen3-4B-Instruct-2507`，非 Thinking 版本；使用对应的官方 Megatron 配置，包括 `rotary-base=5000000`。
 - 本地验证：CPU 单元测试、真实 Slime `Sample` 接口、真实 Qwen tokenizer、ALFWorld 0.4.2 / TextWorld 1.7.0 的真实游戏交互与终局校验。
 - **尚未验证：A100 上的 SGLang/Megatron 内核、权重同步、完整反向传播和训练收敛。** 8×A100 80GB 参数是保守起点，不是吞吐或显存保证。
@@ -26,7 +26,7 @@ src/noise_rl/
   slime_hooks.py    Slime 生成、奖励后处理、独立评测接口
   metrics.py        任务级统计、配对 bootstrap、嵌套采样方差诊断
   swanlab_bridge.py 不改Slime源码的分布式SwanLab指标转发
-  launch.py         固定版本检查、8卡参数、运行记录与安全启动
+  launch.py         Slime状态记录、8卡参数、运行记录与安全启动
 configs/            7组对照/消融配置
 scripts/            训练启动、权重转换、单游戏提取工具
 tests/              CPU 与可选真实依赖接口测试
@@ -49,7 +49,7 @@ noise-rl demo --method independent --tasks 8 --output runs/demo-independent.json
 
 `demo` 使用脚本策略和字符 tokenizer，日志会明确标记 `SCRIPTED_FIXTURE_NOT_LLM`。它仅用于检查闭环，成功率不能用于论证 RL 方法有效。
 
-可选：安装 CPU 接口测试依赖，在干净的固定版本 Slime 源码上运行真实 `Sample` 测试：
+可选：安装 CPU 接口测试依赖，在干净的 Slime 源码上运行真实 `Sample` 测试：
 
 ```bash
 pip install -e '.[dev,contract,alfworld]'
@@ -85,7 +85,7 @@ export PYTHONPATH="/workspace/Megatron-LM${PYTHONPATH:+:${PYTHONPATH}}"
 
 ### 两张GPU一键试跑
 
-如果已经按照 Slime 文档配置好 CUDA、SGLang、Megatron、Ray 和一个干净的固定版本 Slime checkout，可以用下面的脚本完成其余依赖安装、本地资源校验、必要的本地权重转换、dry-run 以及两轮短程在线 RL。脚本不会下载模型或任务数据：
+如果已经按照 Slime 文档配置好 CUDA、SGLang、Megatron、Ray 和一个干净的 Slime checkout，可以用下面的脚本完成其余依赖安装、本地资源校验、必要的本地权重转换、dry-run 以及两轮短程在线 RL。脚本不会下载模型或任务数据：
 
 ```bash
 export SLIME_DIR=/workspace/slime

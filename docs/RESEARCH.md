@@ -41,11 +41,11 @@ A_i=R_i-\frac{1}{|B|-1}\sum_{j\in B,j\ne i}R_j.
 - `matched`：桶为同任务、同环境情景4条轨迹。
 - `coupled_prompt`：采样使用共享情景，但桶仍为同任务8条轨迹，用于分离采样耦合与情景内centering。
 
-`mean` 使用含自己的组均值；相应地，LOO等于mean-centering乘 \(|B|/(|B|-1)\)。标准差消融使用样本标准差、分母加 \(10^{-6}\)，与固定版本Slime的约定一致。
+`mean` 使用含自己的组均值；相应地，LOO等于mean-centering乘 \(|B|/(|B|-1)\)。标准差消融使用样本标准差、分母加 \(10^{-6}\)，与最初验证的Slime版本约定一致；更换Slime版本后必须重新检查该语义。
 
 没有样本标准差归一化时，在给定外生情景下独立采样策略、且满足普通score-function条件，LOO baseline保留期望策略梯度。测试用可枚举Bernoulli任务核验这一点。**这不等于证明实际使用clip、token平均、有限步长的Slime训练过程无偏，也不等于证明方差降低。** 加入标准差归一化会引入不同的权重效应，必须单独消融。
 
-奖励后处理在Slime分发到DP worker之前完成，并按显式任务/情景标识分组；不依赖输入列表顺序。处理后返回 `(raw_rewards, advantages)`；固定版本Slime的GRPO路径把后者广播为token级return，不再做另一次组归一化。
+奖励后处理在Slime分发到DP worker之前完成，并按显式任务/情景标识分组；不依赖输入列表顺序。处理后返回 `(raw_rewards, advantages)`；最初验证的Slime GRPO路径把后者广播为token级return，不再做另一次组归一化。更换Slime版本后需要通过contract test和短程训练确认该行为未变。
 
 ## Harness 与训练的边界
 

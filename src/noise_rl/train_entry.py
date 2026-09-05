@@ -1,4 +1,4 @@
-"""Initialize an isolated Ray runtime with explicit project imports, then enter pinned Slime."""
+"""Initialize an isolated Ray runtime with explicit project imports, then enter Slime."""
 
 import json
 import os

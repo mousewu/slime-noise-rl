@@ -7,7 +7,7 @@ set -euo pipefail
 
 TASK_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TASK_PYTHON_BIN="${PYTHON_BIN:-python}"
-: "${SLIME_DIR:?Set SLIME_DIR to the clean, pinned Slime checkout}"
+: "${SLIME_DIR:?Set SLIME_DIR to a clean Slime checkout}"
 : "${HF_CHECKPOINT:?Set HF_CHECKPOINT to the local Qwen3-4B-Instruct-2507 directory}"
 : "${ALFWORLD_ROOT:?Set ALFWORLD_ROOT to the local ALFWorld json_2.1.1 directory}"
 
@@ -62,7 +62,7 @@ echo "[1/7] Installing project runtime dependencies (Slime and GPU packages are 
 "${TASK_PYTHON_BIN}" -m pip install \
   -e "${TASK_PROJECT_DIR}[alfworld,tracking]"
 
-echo "[2/7] Verifying the pinned Slime checkout and two visible GPUs"
+echo "[2/7] Recording the clean Slime checkout and verifying two visible GPUs"
 "${TASK_PYTHON_BIN}" - "${SLIME_DIR}" <<'PY'
 import importlib
 import json

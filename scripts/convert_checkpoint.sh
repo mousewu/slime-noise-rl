@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-: "${SLIME_DIR:?Set SLIME_DIR to the pinned Slime checkout}"
+: "${SLIME_DIR:?Set SLIME_DIR to a clean Slime checkout}"
 if [[ $# -ne 2 ]]; then
   echo 'Usage: bash scripts/convert_checkpoint.sh HF_MODEL_DIR NEW_MEGATRON_DIR' >&2
   exit 2

@@ -148,7 +148,7 @@ noise-rl prepare --environment alfworld \
 
 默认：单节点8卡、训练 TP=2、4个双卡 rollout engine、colocate、8K上下文、每条轨迹最多2048个模型生成 token、单次输出最多96 token、40个模型回合、50次环境调用。故障概率默认 action-drop=0.15、observation-loss=0.10。
 
-`concurrency` 是全局 SGLang 请求容量：主配置设为 32，在 8 卡、每个 engine 2 卡时对应每个 rollout engine 8 条并发请求。`environment_workers` 则将同步环境调用移出 asyncio 事件循环。ALFWorld 的 TextWorld/Tatsu 解析器不是线程安全的，因此项目会在每个 rollout worker 内串行化真实的 ALFWorld step，默认设为 `environment_workers: 1`；不能通过增加线程数安全地提高 ALFWorld step 并行度。单条轨迹始终严格遵循“生成一个动作 → 执行一个环境 step → 接收观察”的顺序。若要使 ALFWorld 环境本身跨轨迹并行，必须使用进程隔离的环境 runner，而不是线程池。
+`concurrency` 是全局 SGLang 请求容量：主配置设为 32，在 8 卡、每个 engine 2 卡时对应每个 rollout engine 8 条并发请求。`environment_workers` 则将同步环境调用移出 asyncio 事件循环。ALFWorld 的 TextWorld/Tatsu 解析器不是线程安全的，因此项目会在每个 rollout worker 内串行化真实 ALFWorld 的创建、`reset`、`step` 和 `close`；默认设为 `environment_workers: 1`，不能通过增加线程数安全地提高 ALFWorld step 并行度。单条轨迹始终严格遵循“生成一个动作 → 执行一个环境 step → 接收观察”的顺序。若要使 ALFWorld 环境本身跨轨迹并行，必须使用进程隔离的环境 runner，而不是线程池。
 
 先检查命令，不启动 Ray/GPU，也不创建实验输出目录：
 

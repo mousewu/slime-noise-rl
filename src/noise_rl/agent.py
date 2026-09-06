@@ -42,6 +42,36 @@ def environment_executor(workers: int) -> ThreadPoolExecutor:
         return executor
 
 
+def _is_alfworld_environment(env: NoisyEnvironment) -> bool:
+    """Whether a (possibly noisy) environment uses TextWorld underneath."""
+    return isinstance(getattr(env, "env", env), ALFWorldEnvironment)
+
+
+def create_environment(task: dict, environment_factory):
+    """Create a TextWorld game while holding its process-global parser lock."""
+    if task.get("environment") == "alfworld":
+        with _TEXTWORLD_STEP_LOCK:
+            return environment_factory(task)
+    return environment_factory(task)
+
+
+def reset_environment(env: NoisyEnvironment):
+    """Reset a TextWorld game while no worker thread is parsing another game."""
+    if _is_alfworld_environment(env):
+        with _TEXTWORLD_STEP_LOCK:
+            return env.reset()
+    return env.reset()
+
+
+def close_environment(env: NoisyEnvironment) -> None:
+    """Close a TextWorld game while no worker thread is using its parser state."""
+    if _is_alfworld_environment(env):
+        with _TEXTWORLD_STEP_LOCK:
+            env.close()
+    else:
+        env.close()
+
+
 class EpisodeActivity:
     """Track local concurrent trajectories without changing their per-episode order."""
 
@@ -64,10 +94,7 @@ def _execute_environment_step(env: NoisyEnvironment, action: str, retry_limit: i
     # TextWorld's Tatsu grammar parser is process-global and mutable.  Separate
     # ALFWorld instances cannot call it concurrently from Python threads.
     # Keep the event loop unblocked, but serialize only this unsafe backend.
-    backend = getattr(env, "env", env)
-    step_lock = (
-        _TEXTWORLD_STEP_LOCK if isinstance(backend, ALFWorldEnvironment) else None
-    )
+    step_lock = _TEXTWORLD_STEP_LOCK if _is_alfworld_environment(env) else None
     if step_lock is None:
         started = time.monotonic()
         result = execute_with_retry(env, action, retry_limit)
@@ -260,13 +287,13 @@ async def run_episode(
     with EpisodeActivity() as in_flight_at_start:
         protocol = QwenChatProtocol(tokenizer)
         env = NoisyEnvironment(
-            environment_factory(task),
+            create_environment(task, environment_factory),
             config.noise,
             plan.environment_seed,
             config.max_tool_calls,
         )
         try:
-            initial = env.reset()
+            initial = reset_environment(env)
             if initial.success or initial.terminated or initial.truncated:
                 raise ValueError("Task must start in a nonterminal, unsolved state")
             prompt, prompt_tokens = protocol.initial(initial.observation)
@@ -401,4 +428,4 @@ async def run_episode(
             trajectory.elapsed_seconds = time.monotonic() - started
             return trajectory
         finally:
-            env.close()
+            close_environment(env)

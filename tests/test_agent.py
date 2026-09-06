@@ -1,6 +1,7 @@
 import asyncio
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
 import httpx
@@ -10,7 +11,10 @@ from noise_rl.agent import (
     Generation,
     QwenChatProtocol,
     SGLangClient,
+    close_environment,
+    create_environment,
     execute_environment_step,
+    reset_environment,
     run_episode,
 )
 from noise_rl.config import ExperimentConfig, NoiseConfig
@@ -111,6 +115,59 @@ def test_textworld_steps_are_serialized_even_with_multiple_environment_workers()
         return time.monotonic() - started
 
     assert asyncio.run(execute()) >= 0.09
+
+
+def test_textworld_lifecycle_is_serialized_with_steps():
+    def fake_alfworld(reset_delay=0, close_delay=0):
+        environment = object.__new__(ALFWorldEnvironment)
+        environment.reset = lambda: (time.sleep(reset_delay), StepResult("ready"))[1]
+        environment.close = lambda: time.sleep(close_delay)
+        environment.is_read_only = lambda action: True
+        environment.step = lambda action: StepResult(action)
+        return NoisyEnvironment(environment, NoiseConfig(0, 0), seed=1, max_calls=3)
+
+    def factory(_task):
+        time.sleep(0.05)
+        return object()
+
+    async def execute():
+        loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(max_workers=2)
+        try:
+            started = time.monotonic()
+            await asyncio.gather(
+                loop.run_in_executor(
+                    executor, create_environment, {"environment": "alfworld"}, factory
+                ),
+                loop.run_in_executor(
+                    executor, create_environment, {"environment": "alfworld"}, factory
+                ),
+            )
+            create_elapsed = time.monotonic() - started
+
+            first, second = fake_alfworld(reset_delay=0.05), fake_alfworld(
+                reset_delay=0.05
+            )
+            started = time.monotonic()
+            await asyncio.gather(
+                loop.run_in_executor(executor, reset_environment, first),
+                loop.run_in_executor(executor, reset_environment, second),
+            )
+            reset_elapsed = time.monotonic() - started
+
+            first, second = fake_alfworld(close_delay=0.05), fake_alfworld(
+                close_delay=0.05
+            )
+            started = time.monotonic()
+            await asyncio.gather(
+                loop.run_in_executor(executor, close_environment, first),
+                loop.run_in_executor(executor, close_environment, second),
+            )
+            return create_elapsed, reset_elapsed, time.monotonic() - started
+        finally:
+            executor.shutdown(wait=True)
+
+    assert all(elapsed >= 0.09 for elapsed in asyncio.run(execute()))
 
 
 def test_special_tokens_in_observation_are_escaped():

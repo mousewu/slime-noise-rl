@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 
-def main():
+def main(entrypoint: str = "train.py"):
     import ray
 
     from .swanlab_bridge import (
@@ -20,7 +20,10 @@ def main():
     )
 
     slime = Path(sys.argv[1]).resolve()
-    sys.argv = [str(slime / "train.py"), *sys.argv[2:]]
+    script = slime / entrypoint
+    if not script.is_file():
+        raise FileNotFoundError(f"Slime {entrypoint} was not found in {slime}")
+    sys.argv = [str(script), *sys.argv[2:]]
     sys.path.insert(0, str(slime))
     swanlab_settings = (
         json.loads(os.environ[SWANLAB_CONFIG_ENV]) if os.environ.get(SWANLAB_CONFIG_ENV) else None
@@ -59,7 +62,7 @@ def main():
             swanlab_logger = logger_type.options(name=os.environ[SWANLAB_ACTOR_ENV]).remote(swanlab_settings)
             ray.get(swanlab_logger.ready.remote())
             install_slime_logging_patch()
-        runpy.run_path(str(slime / "train.py"), run_name="__main__")
+        runpy.run_path(str(script), run_name="__main__")
     finally:
         training_failed = sys.exc_info()[0] is not None
         try:

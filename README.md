@@ -179,6 +179,44 @@ bash scripts/train.sh \
 
 主实验去掉 `--dry-run`，默认300轮、16个任务/轮、8条轨迹/任务，即 **38,400条轨迹/训练种子**。生成 token 和工具调用成本会因策略而不同，必须同时报告。`--num-rollout` 是总轮数，不是恢复后额外增加的轮数。
 
+### Fully-async rollout：独立、非 colocate 的实验路径
+
+当同步 rollout 被长尾 agent 轨迹阻塞时，可使用独立的 `scripts/train_fully_async.sh`。它通过 Slime 固定版本提供的 `train_async.py` 和 `slime.rollout.fully_async_rollout.generate_rollout_fully_async`，持续保留固定数量的 in-flight group；每次训练只取已经完成的 group，不必等待同批次最慢的轨迹。项目继续使用原有的多轮 `noise_rl.slime_hooks.generate` 和奖励后处理，不修改 Slime 源码。
+
+这不是同步 colocate 配置的开关：Slime 的 async driver 要求训练与 rollout 使用**互不重叠**的 GPU。因此它使用 `--actor-gpus`（Megatron 训练）和 `--rollout-gpus`（SGLang），两者之和必须等于 `--gpus`。默认的 8 卡配方为 4 张训练卡（TP=2、DP=2）和 4 张 rollout 卡（两个 TP=2 engine）。新配置的 `concurrency: 16` 因而会传成每 engine 8 条请求，Slime worker 全局维持 16 个 in-flight group。
+
+先用新输出目录短跑；fully-async 不支持 `--eval-data`、在线 evaluation 或 `--resume`，因为其完成队列并不随 checkpoint 保存：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash scripts/train_fully_async.sh \
+  --config configs/matched_loo_fully_async.yaml \
+  --data data/alfworld/train.jsonl \
+  --hf-checkpoint /models/Qwen3-4B-Instruct-2507 \
+  --megatron-checkpoint /models/Qwen3-4B-Instruct-2507_torch_dist \
+  --output runs/matched-async-smoke-s42 \
+  --seed 42 --gpus 8 --actor-gpus 4 --rollout-gpus 4 \
+  --tensor-parallel 2 --engine-gpus 2 \
+  --batch-size 2 --num-rollout 3 --save-interval 1 \
+  --max-tokens-per-gpu 9216 --use-swanlab \
+  --swanlab-project agentic-noise-rl \
+  --swanlab-experiment-name matched-async-smoke-s42
+```
+
+短跑无误后，建议使用 `--batch-size 8 --num-rollout 600 --save-interval 50`：每个训练 DP rank 的样本数仍为 32，总采样数也与默认同步配方相同。fully-async 改变了样本完成与权重更新的时序，不能把它与同步结果视为逐步等价；论文比较中应将它作为单独训练系统，并对所有方法使用同一 async 拓扑。
+
+评估应在训练任务结束或释放 rollout GPU 后，以保存的 `hf/rollout_<id>/` checkpoint 启动独立的、兼容 `/generate` 的 SGLang server，再运行已有评估工具。例如：
+
+```bash
+noise-rl evaluate \
+  --config configs/matched_loo_fully_async.yaml \
+  --data data/alfworld/valid_unseen.jsonl \
+  --model runs/matched-async-s42/hf/rollout_49 \
+  --url http://127.0.0.1:30000 \
+  --repeats 4 --seed 20260904 \
+  --output runs/matched-async-s42/eval/rollout_49.jsonl
+```
+
 ### SwanLab实验记录（可选）
 
 先通过 `swanlab login` 登录，或只在运行环境中设置 `SWANLAB_API_KEY`；不要把密钥写入启动命令或配置文件。在线记录示例：

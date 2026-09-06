@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from noise_rl import launch
 from noise_rl.config import ExperimentConfig
 from noise_rl.launch import (
     build_command,
@@ -113,6 +114,38 @@ def test_invalid_parallelism_rejected_before_launch(tmp_path):
     args.gpus = 7
     with pytest.raises(ValueError, match="divisible"):
         build_command(args, ExperimentConfig())
+
+
+def test_fully_async_command_is_non_colocated_and_uses_official_rollout(tmp_path, monkeypatch):
+    args = options(tmp_path)
+    args.actor_gpus = 4
+    args.rollout_gpus = 4
+    monkeypatch.setattr(launch, "model_arguments", lambda _slime: [])
+
+    command = build_command(args, ExperimentConfig(concurrency=16), fully_async=True)
+
+    def value(key):
+        return command[command.index(key) + 1]
+
+    assert command[:3] == [sys.executable, "-m", "noise_rl.train_async_entry"]
+    assert value("--actor-num-gpus-per-node") == "4"
+    assert value("--rollout-num-gpus") == "4"
+    assert value("--rollout-function-path") == (
+        "slime.rollout.fully_async_rollout.generate_rollout_fully_async"
+    )
+    assert value("--sglang-server-concurrency") == "8"
+    assert "--colocate" not in command
+    assert "--eval-function-path" not in command
+
+
+def test_fully_async_requires_rollout_gpu_count_to_match_engine_tp(tmp_path, monkeypatch):
+    args = options(tmp_path)
+    args.actor_gpus = 4
+    args.rollout_gpus = 3
+    monkeypatch.setattr(launch, "model_arguments", lambda _slime: [])
+
+    with pytest.raises(ValueError, match="Rollout GPU count"):
+        build_command(args, ExperimentConfig(), fully_async=True)
 
 
 def test_swanlab_config_is_project_owned_and_contains_no_key(tmp_path):

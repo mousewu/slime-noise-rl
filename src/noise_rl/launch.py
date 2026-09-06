@@ -52,10 +52,10 @@ def swanlab_runtime_config(tracking: dict, experiment: dict) -> dict:
     return options
 
 
-def verify_slime(slime_dir):
+def verify_slime(slime_dir, entrypoint="train.py"):
     slime_dir = Path(slime_dir).expanduser().resolve(strict=True)
-    if not (slime_dir / "train.py").is_file():
-        raise FileNotFoundError(f"Slime train.py was not found in {slime_dir}")
+    if not (slime_dir / entrypoint).is_file():
+        raise FileNotFoundError(f"Slime {entrypoint} was not found in {slime_dir}")
     actual = subprocess.check_output(["git", "-C", str(slime_dir), "rev-parse", "HEAD"], text=True).strip()
     # Untracked files are allowed; modified tracked source is not a verified dependency.
     dirty = subprocess.check_output(
@@ -93,23 +93,25 @@ def model_arguments(slime_dir):
     return [x.decode() for x in output.split(b"\0") if x]
 
 
-def build_command(args, config):
+def build_command(args, config, fully_async=False):
     slime = Path(args.slime_dir).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
     batch = args.batch_size * config.group_size
-    if args.gpus < 1 or args.tensor_parallel < 1 or args.gpus % args.tensor_parallel:
+    actor_gpus = args.actor_gpus if fully_async else args.gpus
+    rollout_gpus = args.rollout_gpus if fully_async else args.gpus
+    if actor_gpus < 1 or args.tensor_parallel < 1 or actor_gpus % args.tensor_parallel:
         raise ValueError("GPU count must be divisible by tensor parallelism")
-    if args.gpus % args.engine_gpus:
-        raise ValueError("GPU count must be divisible by GPUs per rollout engine")
-    if batch % (args.gpus // args.tensor_parallel):
+    if rollout_gpus < 1 or rollout_gpus % args.engine_gpus:
+        raise ValueError("Rollout GPU count must be divisible by GPUs per rollout engine")
+    if batch % (actor_gpus // args.tensor_parallel):
         raise ValueError("Global batch must be divisible by data-parallel size")
-    command = [sys.executable, "-m", "noise_rl.train_entry", str(slime)] + model_arguments(slime)
+    entry_module = "noise_rl.train_async_entry" if fully_async else "noise_rl.train_entry"
+    command = [sys.executable, "-m", entry_module, str(slime)] + model_arguments(slime)
     command += [
         "--actor-num-nodes",
         "1",
         "--actor-num-gpus-per-node",
-        str(args.gpus),
-        "--colocate",
+        str(actor_gpus),
         "--hf-checkpoint",
         str(Path(args.hf_checkpoint).expanduser().resolve()),
         "--ref-load",
@@ -135,8 +137,6 @@ def build_command(args, config):
         "noise_rl.slime_hooks.generate",
         "--custom-reward-post-process-path",
         "noise_rl.slime_hooks.reward_postprocess",
-        "--eval-function-path",
-        "noise_rl.slime_hooks.evaluate_rollout",
         "--custom-config-path",
         str(output / "runtime_config.json"),
         "--num-rollout",
@@ -207,7 +207,7 @@ def build_command(args, config):
         "--rollout-num-gpus-per-engine",
         str(args.engine_gpus),
         "--sglang-server-concurrency",
-        str(max(1, config.concurrency // (args.gpus // args.engine_gpus))),
+        str(max(1, config.concurrency // (rollout_gpus // args.engine_gpus))),
         "--sglang-mem-fraction-static",
         "0.55",
         "--sglang-attention-backend",
@@ -224,6 +224,19 @@ def build_command(args, config):
         "--attention-backend",
         "flash",
     ]
+    if fully_async:
+        command += [
+            "--rollout-num-gpus",
+            str(rollout_gpus),
+            "--rollout-function-path",
+            "slime.rollout.fully_async_rollout.generate_rollout_fully_async",
+        ]
+    else:
+        command += [
+            "--colocate",
+            "--eval-function-path",
+            "noise_rl.slime_hooks.evaluate_rollout",
+        ]
     if args.tensor_parallel > 1:
         command.append("--sequence-parallel")
     if getattr(args, "deterministic", False):
@@ -252,7 +265,7 @@ def build_command(args, config):
     return command
 
 
-def main(argv=None):
+def main(argv=None, fully_async=False):
     megatron_lm_dir = configure_megatron_lm_path()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -266,6 +279,19 @@ def main(argv=None):
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpus", type=int, default=8)
+    if fully_async:
+        parser.add_argument(
+            "--actor-gpus",
+            type=int,
+            default=None,
+            help="GPUs reserved for Megatron training; default is tensor parallelism.",
+        )
+        parser.add_argument(
+            "--rollout-gpus",
+            type=int,
+            default=None,
+            help="GPUs reserved for non-colocated SGLang rollout; defaults to the remaining visible GPUs.",
+        )
     parser.add_argument("--tensor-parallel", type=int, default=2)
     parser.add_argument("--engine-gpus", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=16)
@@ -295,6 +321,17 @@ def main(argv=None):
     )
     parser.add_argument("--debug-rollout-only", action="store_true")
     args = parser.parse_args(argv)
+    if fully_async:
+        args.actor_gpus = args.actor_gpus if args.actor_gpus is not None else args.tensor_parallel
+        args.rollout_gpus = args.rollout_gpus if args.rollout_gpus is not None else args.gpus - args.actor_gpus
+        if args.actor_gpus + args.rollout_gpus != args.gpus:
+            parser.error("--actor-gpus plus --rollout-gpus must equal --gpus")
+        if args.resume:
+            parser.error("Fully-async rollout queues are not checkpointed; start a new output directory instead of --resume")
+        if args.eval_data:
+            parser.error(
+                "Slime fully-async rollout has no online evaluation; evaluate a saved checkpoint in a separate task"
+            )
     for key in (
         "engine_gpus",
         "batch_size",
@@ -315,7 +352,7 @@ def main(argv=None):
     )
     if args.max_tokens_per_gpu < config.max_context_tokens:
         raise ValueError("max-tokens-per-gpu must accommodate one full trajectory context")
-    slime_commit = verify_slime(args.slime_dir)
+    slime_commit = verify_slime(args.slime_dir, "train_async.py" if fully_async else "train.py")
     validate_local_checkpoints(args.hf_checkpoint, args.megatron_checkpoint)
     training = read_records(args.data)
     validate_local_records(training)
@@ -330,7 +367,7 @@ def main(argv=None):
             for r in evaluation
         ):
             raise ValueError("Train/eval overlap")
-    command = build_command(args, config)
+    command = build_command(args, config, fully_async=fully_async)
     print(shlex.join(command), flush=True)
     if args.dry_run:
         return

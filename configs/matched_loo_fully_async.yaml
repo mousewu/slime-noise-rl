@@ -1,0 +1,14 @@
+noise_rl:
+  method: matched
+  group_size: 8
+  scenarios: 2
+  baseline: loo
+  std_normalization: false
+  # Default 8-GPU async topology reserves 4 GPUs for training and 4 for two
+  # TP=2 rollout engines. Slime therefore maintains 8 x 2 = 16 groups in flight.
+  concurrency: 16
+  # TextWorld/Tatsu is parser-serialized inside each rollout worker.
+  environment_workers: 1
+  noise:
+    action_drop: 0.15
+    observation_loss: 0.10

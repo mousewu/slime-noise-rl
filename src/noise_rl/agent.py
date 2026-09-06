@@ -1,6 +1,9 @@
+import asyncio
 import math
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from threading import Lock
 
 import httpx
 
@@ -18,6 +21,69 @@ clean <object> with <receptacle>, heat <object> with <receptacle>,
 cool <object> with <receptacle>, and use <object>.
 Tools can fail. If an outcome is uncertain, inspect the current state before deciding what to do.
 The episode ends when the environment verifies the goal or the interaction budget is exhausted."""
+
+
+_ENVIRONMENT_EXECUTORS: dict[int, ThreadPoolExecutor] = {}
+_ENVIRONMENT_EXECUTORS_LOCK = Lock()
+_EPISODE_ACTIVITY_LOCK = Lock()
+_IN_FLIGHT_EPISODES = 0
+
+
+def environment_executor(workers: int) -> ThreadPoolExecutor:
+    """Return the process-local, bounded executor for independent environment steps."""
+    with _ENVIRONMENT_EXECUTORS_LOCK:
+        executor = _ENVIRONMENT_EXECUTORS.get(workers)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="noise-rl-env"
+            )
+            _ENVIRONMENT_EXECUTORS[workers] = executor
+        return executor
+
+
+class EpisodeActivity:
+    """Track local concurrent trajectories without changing their per-episode order."""
+
+    def __enter__(self) -> int:
+        global _IN_FLIGHT_EPISODES
+        with _EPISODE_ACTIVITY_LOCK:
+            _IN_FLIGHT_EPISODES += 1
+            return _IN_FLIGHT_EPISODES
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        global _IN_FLIGHT_EPISODES
+        with _EPISODE_ACTIVITY_LOCK:
+            _IN_FLIGHT_EPISODES -= 1
+            if _IN_FLIGHT_EPISODES < 0:  # Defensive: never conceal a lifecycle bug.
+                _IN_FLIGHT_EPISODES = 0
+                raise RuntimeError("Episode activity counter became negative")
+
+
+def _execute_environment_step(env: NoisyEnvironment, action: str, retry_limit: int):
+    started = time.monotonic()
+    result = execute_with_retry(env, action, retry_limit)
+    return result, started, time.monotonic()
+
+
+async def execute_environment_step(
+    env: NoisyEnvironment, action: str, retry_limit: int, workers: int
+):
+    """Run one independent environment interaction without blocking the rollout loop.
+
+    A trajectory awaits its own result before its next action, so environment
+    state transitions remain strictly sequential.  Only distinct trajectories
+    can occupy different executor threads.
+    """
+    queued = time.monotonic()
+    loop = asyncio.get_running_loop()
+    result, started, finished = await loop.run_in_executor(
+        environment_executor(workers),
+        _execute_environment_step,
+        env,
+        action,
+        retry_limit,
+    )
+    return result, started - queued, finished - started
 
 
 @dataclass
@@ -50,10 +116,17 @@ class Trajectory:
     inference_input_tokens: int = 0
     tool_calls: int = 0
     elapsed_seconds: float = 0.0
+    model_requests: int = 0
+    model_request_seconds: float = 0.0
+    environment_queue_seconds: float = 0.0
+    environment_step_seconds: float = 0.0
+    in_flight_episodes_at_start: int = 0
 
     @property
     def tokens(self):
-        return self.prompt_tokens + [t for segment in self.segments for t in segment.tokens]
+        return self.prompt_tokens + [
+            t for segment in self.segments for t in segment.tokens
+        ]
 
     @property
     def generated_tokens(self):
@@ -75,9 +148,16 @@ class QwenChatProtocol:
         self.tokenizer = tokenizer
         self.end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
         self.start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
-        for text, token in (("<|im_end|>", self.end_id), ("<|im_start|>", self.start_id)):
-            if not isinstance(token, int) or tokenizer.encode(text, add_special_tokens=False) != [token]:
-                raise ValueError("This implementation requires a Qwen im_start/im_end tokenizer")
+        for text, token in (
+            ("<|im_end|>", self.end_id),
+            ("<|im_start|>", self.start_id),
+        ):
+            if not isinstance(token, int) or tokenizer.encode(
+                text, add_special_tokens=False
+            ) != [token]:
+                raise ValueError(
+                    "This implementation requires a Qwen im_start/im_end tokenizer"
+                )
 
     @staticmethod
     def safe_observation(text):
@@ -94,7 +174,9 @@ class QwenChatProtocol:
         )
         # The selected Instruct-2507 template must end directly at the assistant prefix.
         if not text.endswith("<|im_start|>assistant\n"):
-            raise ValueError("Unsupported chat template: use Qwen3-4B-Instruct-2507, not a Thinking template")
+            raise ValueError(
+                "Unsupported chat template: use Qwen3-4B-Instruct-2507, not a Thinking template"
+            )
         return text, self.tokenizer.encode(text, add_special_tokens=False)
 
     def observation_segment(self, observation):
@@ -103,7 +185,9 @@ class QwenChatProtocol:
             + self.safe_observation(observation)
             + "<|im_end|>\n<|im_start|>assistant\n"
         )
-        return Segment(self.tokenizer.encode(text, add_special_tokens=False), None, text, False)
+        return Segment(
+            self.tokenizer.encode(text, add_special_tokens=False), None, text, False
+        )
 
     def action_text(self, tokens):
         return self.tokenizer.decode(tokens, skip_special_tokens=True)
@@ -112,7 +196,9 @@ class QwenChatProtocol:
 class SGLangClient:
     def __init__(self, url: str, timeout: float = 180, headers=None):
         self.url = url.rstrip("/") + "/generate"
-        self.client = httpx.AsyncClient(timeout=timeout, headers=headers, trust_env=False)
+        self.client = httpx.AsyncClient(
+            timeout=timeout, headers=headers, trust_env=False
+        )
 
     async def generate(self, tokens, sampling_params):
         response = await self.client.post(
@@ -129,11 +215,16 @@ class SGLangClient:
         meta = data["meta_info"]
         pairs = meta.get("output_token_logprobs")
         if not pairs:
-            raise RuntimeError("SGLang returned no output token logprobs; cannot train on re-tokenized text")
+            raise RuntimeError(
+                "SGLang returned no output token logprobs; cannot train on re-tokenized text"
+            )
         ids, probs = [p[1] for p in pairs], [p[0] for p in pairs]
         if not all(type(t) is int and t >= 0 for t in ids):
             raise ValueError("Invalid output token ids")
-        if not all(isinstance(p, (int, float)) and math.isfinite(p) and p <= 1e-5 for p in probs):
+        if not all(
+            isinstance(p, (int, float)) and math.isfinite(p) and p <= 1e-5
+            for p in probs
+        ):
             raise ValueError("Invalid rollout log probabilities")
         finish = meta.get("finish_reason", {})
         reason = finish.get("type") if isinstance(finish, dict) else finish
@@ -153,91 +244,148 @@ async def run_episode(
     environment_factory=make_environment,
 ) -> Trajectory:
     started = time.monotonic()
-    protocol = QwenChatProtocol(tokenizer)
-    env = NoisyEnvironment(
-        environment_factory(task), config.noise, plan.environment_seed, config.max_tool_calls
-    )
-    try:
-        initial = env.reset()
-        if initial.success or initial.terminated or initial.truncated:
-            raise ValueError("Task must start in a nonterminal, unsolved state")
-        prompt, prompt_tokens = protocol.initial(initial.observation)
-        if len(prompt_tokens) >= config.max_context_tokens:
-            raise ValueError(f"Initial prompt exceeds the context budget: {task['id']}")
-        trajectory = Trajectory(prompt, prompt_tokens)
-        params = dict(sampling_params or {"temperature": 0.8, "top_p": 1.0, "top_k": -1})
-        if params.get("top_p", 1.0) != 1.0 or params.get("top_k", -1) != -1:
-            raise ValueError("First version requires top_p=1, top_k=-1 for comparable full-support rollouts")
-        # Engine sampling limits and protocol stops cannot be overridden by dataset params.
-        params.pop("stop", None)
-        params.pop("min_new_tokens", None)
-        params.update(stop_token_ids=[protocol.end_id], no_stop_trim=True, skip_special_tokens=False)
-        for turn in range(config.max_turns):
-            token_ids = trajectory.tokens
-            remaining = min(
-                config.max_generated_tokens - trajectory.generated_tokens,
-                config.max_context_tokens - len(token_ids),
-                config.max_tokens_per_turn,
-            )
-            if remaining <= 0:
-                trajectory.termination = "token_budget"
-                break
-            call_params = dict(
-                params,
-                max_new_tokens=remaining,
-                sampling_seed=stable_seed(plan.policy_seed, turn) % (2**31 - 1),
-            )
-            generated = await client.generate(token_ids, call_params)
-            if not generated.tokens or len(generated.tokens) != len(generated.log_probs):
-                raise ValueError("Unaligned/empty generation")
-            if len(generated.tokens) > remaining:
-                raise ValueError("Inference server exceeded the requested token budget")
-            trajectory.inference_input_tokens += len(token_ids)
-            trajectory.segments.append(
-                Segment(generated.tokens, generated.log_probs, generated.text, True, generated.meta_info)
-            )
-            if generated.finish_reason == "abort":
-                raise RuntimeError(
-                    "Inference was aborted; do not turn infrastructure failures into zero reward"
+    with EpisodeActivity() as in_flight_at_start:
+        protocol = QwenChatProtocol(tokenizer)
+        env = NoisyEnvironment(
+            environment_factory(task),
+            config.noise,
+            plan.environment_seed,
+            config.max_tool_calls,
+        )
+        try:
+            initial = env.reset()
+            if initial.success or initial.terminated or initial.truncated:
+                raise ValueError("Task must start in a nonterminal, unsolved state")
+            prompt, prompt_tokens = protocol.initial(initial.observation)
+            if len(prompt_tokens) >= config.max_context_tokens:
+                raise ValueError(
+                    f"Initial prompt exceeds the context budget: {task['id']}"
                 )
-            if generated.finish_reason == "length":
-                trajectory.termination = "generation_length"
-                break  # Never execute a truncated tool call.
-            if generated.finish_reason != "stop" or generated.tokens[-1] != protocol.end_id:
-                raise ValueError("Expected retained im_end stop token in SGLang token/logprob response")
-            response_text = protocol.action_text(generated.tokens)
-            try:
-                action = parse_action(response_text)
-            except ValueError as exc:
-                observation = f"FORMAT_ERROR: {exc}"
-                trajectory.steps.append(
-                    {"turn": turn, "action": None, "format_error": True, "observation": observation}
+            trajectory = Trajectory(
+                prompt, prompt_tokens, in_flight_episodes_at_start=in_flight_at_start
+            )
+            params = dict(
+                sampling_params or {"temperature": 0.8, "top_p": 1.0, "top_k": -1}
+            )
+            if params.get("top_p", 1.0) != 1.0 or params.get("top_k", -1) != -1:
+                raise ValueError(
+                    "First version requires top_p=1, top_k=-1 for comparable full-support rollouts"
                 )
-            else:
-                result = execute_with_retry(env, action, config.retry_limit)
-                observation = result.observation
-                trajectory.steps.append(
-                    {"turn": turn, "action": action, "format_error": False, "observation": observation}
+            # Engine sampling limits and protocol stops cannot be overridden by dataset params.
+            params.pop("stop", None)
+            params.pop("min_new_tokens", None)
+            params.update(
+                stop_token_ids=[protocol.end_id],
+                no_stop_trim=True,
+                skip_special_tokens=False,
+            )
+            for turn in range(config.max_turns):
+                token_ids = trajectory.tokens
+                remaining = min(
+                    config.max_generated_tokens - trajectory.generated_tokens,
+                    config.max_context_tokens - len(token_ids),
+                    config.max_tokens_per_turn,
                 )
-                trajectory.success = result.success
-                if result.terminated or result.truncated:
-                    trajectory.termination = (
-                        "success"
-                        if result.success
-                        else ("tool_budget" if result.truncated else "environment_terminal")
-                    )
+                if remaining <= 0:
+                    trajectory.termination = "token_budget"
                     break
-            if turn + 1 == config.max_turns:
-                trajectory.termination = "turn_budget"
-                break
-            bridge = protocol.observation_segment(observation)
-            if len(trajectory.tokens) + len(bridge.tokens) >= config.max_context_tokens:
-                trajectory.termination = "context_budget"
-                break  # No silent history truncation or retokenization.
-            trajectory.segments.append(bridge)
-        trajectory.audit = list(env.audit)
-        trajectory.tool_calls = env.calls
-        trajectory.elapsed_seconds = time.monotonic() - started
-        return trajectory
-    finally:
-        env.close()
+                call_params = dict(
+                    params,
+                    max_new_tokens=remaining,
+                    sampling_seed=stable_seed(plan.policy_seed, turn) % (2**31 - 1),
+                )
+                model_started = time.monotonic()
+                generated = await client.generate(token_ids, call_params)
+                trajectory.model_requests += 1
+                trajectory.model_request_seconds += time.monotonic() - model_started
+                if not generated.tokens or len(generated.tokens) != len(
+                    generated.log_probs
+                ):
+                    raise ValueError("Unaligned/empty generation")
+                if len(generated.tokens) > remaining:
+                    raise ValueError(
+                        "Inference server exceeded the requested token budget"
+                    )
+                trajectory.inference_input_tokens += len(token_ids)
+                trajectory.segments.append(
+                    Segment(
+                        generated.tokens,
+                        generated.log_probs,
+                        generated.text,
+                        True,
+                        generated.meta_info,
+                    )
+                )
+                if generated.finish_reason == "abort":
+                    raise RuntimeError(
+                        "Inference was aborted; do not turn infrastructure failures into zero reward"
+                    )
+                if generated.finish_reason == "length":
+                    trajectory.termination = "generation_length"
+                    break  # Never execute a truncated tool call.
+                if (
+                    generated.finish_reason != "stop"
+                    or generated.tokens[-1] != protocol.end_id
+                ):
+                    raise ValueError(
+                        "Expected retained im_end stop token in SGLang token/logprob response"
+                    )
+                response_text = protocol.action_text(generated.tokens)
+                try:
+                    action = parse_action(response_text)
+                except ValueError as exc:
+                    observation = f"FORMAT_ERROR: {exc}"
+                    trajectory.steps.append(
+                        {
+                            "turn": turn,
+                            "action": None,
+                            "format_error": True,
+                            "observation": observation,
+                        }
+                    )
+                else:
+                    result, queued_seconds, environment_seconds = (
+                        await execute_environment_step(
+                            env, action, config.retry_limit, config.environment_workers
+                        )
+                    )
+                    trajectory.environment_queue_seconds += queued_seconds
+                    trajectory.environment_step_seconds += environment_seconds
+                    observation = result.observation
+                    trajectory.steps.append(
+                        {
+                            "turn": turn,
+                            "action": action,
+                            "format_error": False,
+                            "observation": observation,
+                        }
+                    )
+                    trajectory.success = result.success
+                    if result.terminated or result.truncated:
+                        trajectory.termination = (
+                            "success"
+                            if result.success
+                            else (
+                                "tool_budget"
+                                if result.truncated
+                                else "environment_terminal"
+                            )
+                        )
+                        break
+                if turn + 1 == config.max_turns:
+                    trajectory.termination = "turn_budget"
+                    break
+                bridge = protocol.observation_segment(observation)
+                if (
+                    len(trajectory.tokens) + len(bridge.tokens)
+                    >= config.max_context_tokens
+                ):
+                    trajectory.termination = "context_budget"
+                    break  # No silent history truncation or retokenization.
+                trajectory.segments.append(bridge)
+            trajectory.audit = list(env.audit)
+            trajectory.tool_calls = env.calls
+            trajectory.elapsed_seconds = time.monotonic() - started
+            return trajectory
+        finally:
+            env.close()

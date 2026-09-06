@@ -4,6 +4,13 @@ noise_rl:
   scenarios: 2
   baseline: loo
   std_normalization: false
+  # Global SGLang request capacity.  With 8 GPUs and 2 GPUs per engine, this
+  # becomes 8 concurrent requests for each of the 4 rollout engines.
+  concurrency: 32
+  # Per rollout-worker environment-step threads.  This does not batch actions
+  # within one trajectory; it lets independent ALFWorld trajectories progress
+  # while other trajectories await SGLang responses.
+  environment_workers: 8
   noise:
     action_drop: 0.15
     observation_loss: 0.10

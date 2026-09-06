@@ -1,11 +1,20 @@
 import asyncio
+import threading
+import time
 from dataclasses import replace
 
 import httpx
 import pytest
 
-from noise_rl.agent import Generation, QwenChatProtocol, SGLangClient, run_episode
+from noise_rl.agent import (
+    Generation,
+    QwenChatProtocol,
+    SGLangClient,
+    execute_environment_step,
+    run_episode,
+)
 from noise_rl.config import ExperimentConfig, NoiseConfig
+from noise_rl.envs import StepResult
 from noise_rl.fixtures import ByteTokenizer, ScriptedClient
 from noise_rl.sampling import plan_sample
 
@@ -28,15 +37,53 @@ def test_multi_turn_tokens_masks_and_no_hidden_seed(task):
     assert trajectory.success and trajectory.tool_calls == 3
     assert len(trajectory.segments) == 5
     assert sum(trajectory.loss_mask) == trajectory.generated_tokens
-    assert len(trajectory.loss_mask) == len(trajectory.tokens) - len(trajectory.prompt_tokens)
+    assert len(trajectory.loss_mask) == len(trajectory.tokens) - len(
+        trajectory.prompt_tokens
+    )
     text = ByteTokenizer().decode(trajectory.tokens)
-    assert "environment_seed" not in text and "dropped" not in text and "noise_plan" not in text
+    assert (
+        "environment_seed" not in text
+        and "dropped" not in text
+        and "noise_plan" not in text
+    )
     assert "<|im_end|>\n<|im_start|>user" in text
     for segment in trajectory.segments:
         if segment.trainable:
             assert len(segment.tokens) == len(segment.log_probs)
         else:
             assert segment.log_probs is None
+    assert trajectory.model_requests == sum(
+        segment.trainable for segment in trajectory.segments
+    )
+    assert trajectory.environment_step_seconds >= 0
+
+
+def test_environment_steps_use_bounded_worker_threads_without_blocking_loop():
+    class SlowEnvironment:
+        def __init__(self):
+            self.thread_id = None
+
+        def step(self, action):
+            self.thread_id = threading.get_ident()
+            time.sleep(0.05)
+            return StepResult(action)
+
+    async def execute():
+        first, second = SlowEnvironment(), SlowEnvironment()
+        started = time.monotonic()
+        results = await asyncio.gather(
+            execute_environment_step(first, "first", 0, workers=2),
+            execute_environment_step(second, "second", 0, workers=2),
+        )
+        return first, second, results, time.monotonic() - started
+
+    first, second, results, elapsed = asyncio.run(execute())
+    assert (
+        first.thread_id != threading.get_ident()
+        and second.thread_id != threading.get_ident()
+    )
+    assert elapsed < 0.09
+    assert all(queue >= 0 and execution >= 0 for _result, queue, execution in results)
 
 
 def test_special_tokens_in_observation_are_escaped():
@@ -117,7 +164,10 @@ def test_native_sglang_http_contract():
             json={
                 "text": "x",
                 "meta_info": {
-                    "output_token_logprobs": [[-0.2, 3, "x"], [-0.4, 151645, "<|im_end|>"]],
+                    "output_token_logprobs": [
+                        [-0.2, 3, "x"],
+                        [-0.4, 151645, "<|im_end|>"],
+                    ],
                     "finish_reason": {"type": "stop"},
                 },
             },

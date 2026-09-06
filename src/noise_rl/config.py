@@ -38,6 +38,7 @@ class ExperimentConfig:
     max_tokens_per_turn: int = 96
     request_timeout: float = 180.0
     concurrency: int = 16
+    environment_workers: int = 8
     retry_limit: int = 0
     trace_dir: str | None = None
 
@@ -57,6 +58,7 @@ class ExperimentConfig:
             "max_generated_tokens",
             "max_tokens_per_turn",
             "concurrency",
+            "environment_workers",
         ):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -64,7 +66,9 @@ class ExperimentConfig:
         if self.group_size < 2 or self.group_size % self.scenarios:
             raise ValueError("group_size must be >=2 and divisible by scenarios")
         if self.method == "matched" and self.group_size // self.scenarios < 2:
-            raise ValueError("Matched groups require at least two policy samples per scenario")
+            raise ValueError(
+                "Matched groups require at least two policy samples per scenario"
+            )
         if self.max_context_tokens <= self.max_tokens_per_turn:
             raise ValueError("Context must be larger than a single generation")
         if type(self.retry_limit) is not int or self.retry_limit < 0:

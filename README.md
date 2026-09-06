@@ -148,6 +148,8 @@ noise-rl prepare --environment alfworld \
 
 默认：单节点8卡、训练 TP=2、4个双卡 rollout engine、colocate、8K上下文、每条轨迹最多2048个模型生成 token、单次输出最多96 token、40个模型回合、50次环境调用。故障概率默认 action-drop=0.15、observation-loss=0.10。
 
+`concurrency` 是全局 SGLang 请求容量：默认主配置设为 32，在 8 卡、每个 engine 2 卡时对应每个 rollout engine 8 条并发请求。`environment_workers: 8` 则是每个 rollout worker 的受限环境线程数。前者控制模型服务可同时处理多少条生成，后者避免环境 step 阻塞这些轨迹继续向模型提交请求；两者应先保持相同的每-engine 容量。单条轨迹仍严格遵循“生成一个动作 → 执行一个环境 step → 接收观察”的顺序。只有当 `rollout/environment_queue_seconds/*` 接近 0 且 CPU 仍有余量时才考虑提高这两个值；所有论文对照组必须固定它们。
+
 先检查命令，不启动 Ray/GPU，也不创建实验输出目录：
 
 ```bash
@@ -198,7 +200,7 @@ bash scripts/train.sh \
 
 可用 `--swanlab-mode offline` 仅保存本地记录，或者用 `--swanlab-mode local` 配合本地看板；默认日志目录是运行目录下的 `swanlab/`，可通过 `--swanlab-logdir` 改写。`SWANLAB_API_HOST` 可指定私有部署地址。
 
-接入层不修改 Slime 源码：Ray 的 worker setup hook 在每个训练进程中保留 Slime 原日志调用，并把标量指标转发给单一 SwanLab logger actor。SwanLab SDK 自动维护全局事件 step（包括断点恢复），桥接层同时保留 `train/step`、`rollout/step`、`eval/step` 等 Slime 原生计数器。每个完整 rollout 还会从逐轨迹 trace 汇总并记录 `rollout/success_rate`、token、工具调用、轨迹耗时、终止原因和实际噪声触发率；评估会产生对应的 `eval/<dataset>/*` 指标。`--resume` 会复用 `run.json` 中保存的 SwanLab run ID；恢复时保持 SwanLab 项目、实验名和日志目录不变。
+接入层不修改 Slime 源码：Ray 的 worker setup hook 在每个训练进程中保留 Slime 原日志调用，并把标量指标转发给单一 SwanLab logger actor。SwanLab SDK 自动维护全局事件 step（包括断点恢复），桥接层同时保留 `train/step`、`rollout/step`、`eval/step` 等 Slime 原生计数器。每个完整 rollout 还会从逐轨迹 trace 汇总并记录 `rollout/success_rate`、token、工具调用、轨迹耗时、模型请求耗时、环境 step/排队耗时、worker 内 in-flight 轨迹数、终止原因和实际噪声触发率；评估会产生对应的 `eval/<dataset>/*` 指标。`--resume` 会复用 `run.json` 中保存的 SwanLab run ID；恢复时保持 SwanLab 项目、实验名和日志目录不变。
 
 运行目录包含：
 

@@ -8,7 +8,7 @@ from threading import Lock
 import httpx
 
 from .config import ExperimentConfig
-from .envs import make_environment, parse_action
+from .envs import ALFWorldEnvironment, make_environment, parse_action
 from .noise import NoisyEnvironment, execute_with_retry
 from .sampling import SamplingPlan, stable_seed
 
@@ -26,6 +26,7 @@ The episode ends when the environment verifies the goal or the interaction budge
 _ENVIRONMENT_EXECUTORS: dict[int, ThreadPoolExecutor] = {}
 _ENVIRONMENT_EXECUTORS_LOCK = Lock()
 _EPISODE_ACTIVITY_LOCK = Lock()
+_TEXTWORLD_STEP_LOCK = Lock()
 _IN_FLIGHT_EPISODES = 0
 
 
@@ -60,8 +61,20 @@ class EpisodeActivity:
 
 
 def _execute_environment_step(env: NoisyEnvironment, action: str, retry_limit: int):
-    started = time.monotonic()
-    result = execute_with_retry(env, action, retry_limit)
+    # TextWorld's Tatsu grammar parser is process-global and mutable.  Separate
+    # ALFWorld instances cannot call it concurrently from Python threads.
+    # Keep the event loop unblocked, but serialize only this unsafe backend.
+    backend = getattr(env, "env", env)
+    step_lock = (
+        _TEXTWORLD_STEP_LOCK if isinstance(backend, ALFWorldEnvironment) else None
+    )
+    if step_lock is None:
+        started = time.monotonic()
+        result = execute_with_retry(env, action, retry_limit)
+    else:
+        with step_lock:
+            started = time.monotonic()
+            result = execute_with_retry(env, action, retry_limit)
     return result, started, time.monotonic()
 
 

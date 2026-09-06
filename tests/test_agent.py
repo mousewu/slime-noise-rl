@@ -14,8 +14,9 @@ from noise_rl.agent import (
     run_episode,
 )
 from noise_rl.config import ExperimentConfig, NoiseConfig
-from noise_rl.envs import StepResult
+from noise_rl.envs import ALFWorldEnvironment, StepResult
 from noise_rl.fixtures import ByteTokenizer, ScriptedClient
+from noise_rl.noise import NoisyEnvironment
 from noise_rl.sampling import plan_sample
 
 
@@ -84,6 +85,32 @@ def test_environment_steps_use_bounded_worker_threads_without_blocking_loop():
     )
     assert elapsed < 0.09
     assert all(queue >= 0 and execution >= 0 for _result, queue, execution in results)
+
+
+def test_textworld_steps_are_serialized_even_with_multiple_environment_workers():
+    def make_environment():
+        environment = object.__new__(ALFWorldEnvironment)
+        environment.reset = lambda: StepResult("ready")
+        environment.is_read_only = lambda action: True
+
+        def step(action):
+            time.sleep(0.05)
+            return StepResult(action)
+
+        environment.step = step
+        noisy = NoisyEnvironment(environment, NoiseConfig(0, 0), seed=1, max_calls=3)
+        noisy.reset()
+        return noisy
+
+    async def execute():
+        started = time.monotonic()
+        await asyncio.gather(
+            execute_environment_step(make_environment(), "first", 0, workers=2),
+            execute_environment_step(make_environment(), "second", 0, workers=2),
+        )
+        return time.monotonic() - started
+
+    assert asyncio.run(execute()) >= 0.09
 
 
 def test_special_tokens_in_observation_are_escaped():

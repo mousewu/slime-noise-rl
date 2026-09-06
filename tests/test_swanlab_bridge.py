@@ -1,9 +1,15 @@
-import sys
 import json
+import logging
+import sys
 from types import ModuleType, SimpleNamespace
 
 from noise_rl import swanlab_bridge
-from noise_rl.swanlab_bridge import SwanLabLogger, install_slime_logging_patch, scalar_metrics
+from noise_rl.swanlab_bridge import (
+    SwanLabLogger,
+    _SwanLabLogMirror,
+    install_slime_logging_patch,
+    scalar_metrics,
+)
 
 
 class ItemScalar:
@@ -63,6 +69,64 @@ def test_logger_leaves_global_step_to_sdk_and_keeps_slime_step(monkeypatch, tmp_
     assert calls[3] == ("finish",)
     events = [json.loads(line) for line in (tmp_path / "swanlab" / "metric_events.jsonl").read_text().splitlines()]
     assert [event["metrics"] for event in events] == [calls[1][1], calls[2][1]]
+
+
+def test_logger_mirrors_worker_text_to_swanlab_stdout_and_audit(monkeypatch, tmp_path, capsys):
+    fake = ModuleType("swanlab")
+    fake.init = lambda **kwargs: SimpleNamespace(id=kwargs["id"])
+    fake.log = lambda values: None
+    fake.finish = lambda: None
+    monkeypatch.setitem(sys.modules, "swanlab", fake)
+    monkeypatch.setenv("SWANLAB_API_KEY", "secret-value")
+
+    logger = SwanLabLogger(
+        {
+            "project": "research",
+            "experiment_name": "matched-s42",
+            "mode": "offline",
+            "logdir": str(tmp_path / "swanlab"),
+            "id": "run-id",
+            "resume": "allow",
+        }
+    )
+    logger.log_text(
+        {"time": 1.0, "level": "INFO", "logger": "DetailLogger", "message": "key=secret-value"}
+    )
+
+    assert "[noise-rl][INFO][DetailLogger] key=<SWANLAB_API_KEY_REDACTED>" in capsys.readouterr().out
+    events = [json.loads(line) for line in (tmp_path / "swanlab" / "forwarded_logs.jsonl").read_text().splitlines()]
+    assert events == [
+        {
+            "event": 1,
+            "level": "INFO",
+            "logger": "DetailLogger",
+            "message": "key=<SWANLAB_API_KEY_REDACTED>",
+            "time": 1.0,
+        }
+    ]
+
+
+def test_worker_log_handler_submits_nonblocking_text(monkeypatch):
+    forwarded = []
+
+    class RemoteLogText:
+        def remote(self, payload):
+            forwarded.append(payload)
+
+    monkeypatch.setattr(
+        swanlab_bridge,
+        "_logger_actor",
+        lambda: SimpleNamespace(log_text=RemoteLogText()),
+    )
+    monkeypatch.setenv(swanlab_bridge.SWANLAB_ACTOR_ENV, "logger")
+    handler = _SwanLabLogMirror()
+    record = logging.LogRecord("DetailLogger", logging.WARNING, __file__, 1, "slow rollout %s", (7,), None)
+
+    handler.emit(record)
+
+    assert forwarded[0]["level"] == "WARNING"
+    assert forwarded[0]["logger"] == "DetailLogger"
+    assert forwarded[0]["message"] == "slow rollout 7"
 
 
 def test_runtime_patch_preserves_slime_logger_and_forwards_once(monkeypatch):

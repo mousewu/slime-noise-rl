@@ -15,6 +15,7 @@ def main(entrypoint: str = "train.py"):
         SWANLAB_ACTOR_ENV,
         SWANLAB_CONFIG_ENV,
         SwanLabLogger,
+        install_log_mirror,
         install_slime_logging_patch,
         setup_worker,
     )
@@ -62,6 +63,7 @@ def main(entrypoint: str = "train.py"):
             swanlab_logger = logger_type.options(name=os.environ[SWANLAB_ACTOR_ENV]).remote(swanlab_settings)
             ray.get(swanlab_logger.ready.remote())
             install_slime_logging_patch()
+            install_log_mirror()
         runpy.run_path(str(script), run_name="__main__")
     finally:
         training_failed = sys.exc_info()[0] is not None

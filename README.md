@@ -240,6 +240,8 @@ bash scripts/train.sh \
 
 接入层不修改 Slime 源码：Ray 的 worker setup hook 在每个训练进程中保留 Slime 原日志调用，并把标量指标转发给单一 SwanLab logger actor。SwanLab SDK 自动维护全局事件 step（包括断点恢复），桥接层同时保留 `train/step`、`rollout/step`、`eval/step` 等 Slime 原生计数器。每个完整 rollout 还会从逐轨迹 trace 汇总并记录 `rollout/success_rate`、token、工具调用、轨迹耗时、模型请求耗时、环境 step/排队耗时、worker 内 in-flight 轨迹数、终止原因和实际噪声触发率；评估会产生对应的 `eval/<dataset>/*` 指标。`--resume` 会复用 `run.json` 中保存的 SwanLab run ID；恢复时保持 SwanLab 项目、实验名和日志目录不变。
 
+启用 SwanLab 后，项目还会将每个 Ray worker 的 Python `INFO`、`WARNING`、`ERROR` 日志非阻塞镜像到 SwanLab 的 Logs 页；原始 Ray 日志仍保留在 Ray session 目录。本地 `swanlab/forwarded_logs.jsonl` 是镜像日志的完整审计副本，`metric_events.jsonl` 则保存标量指标。为减少噪声或上传量，可在启动前设置 `NOISE_RL_SWANLAB_LOG_LEVEL=WARNING`（默认 `INFO`）。`SWANLAB_API_KEY`、`HF_TOKEN` 和 `HUGGING_FACE_HUB_TOKEN` 出现在日志文本时会被脱敏。
+
 运行目录包含：
 
 - `run.json`、`runtime_config.json`：启动命令、Slime版本、完整实验参数。

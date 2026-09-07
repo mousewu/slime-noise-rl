@@ -8,6 +8,39 @@ import uuid
 from pathlib import Path
 
 
+_UNIX_SOCKET_PATH_MAX = 107
+_RAY_SOCKET_SUFFIX = "session_2026-09-07_23-59-59_999999_999999/sockets/plasma_store"
+
+
+def ray_temp_directory() -> str | None:
+    """Return a short lexical Ray root without resolving a useful symlink.
+
+    Ray puts Unix-domain sockets under its session directory.  Unlike ordinary
+    temporary files, those have a 107-byte path limit on Linux.  A project data
+    directory can be a perfectly valid TMPDIR for FastDownward yet be too long
+    for Ray.  ``NOISE_RL_RAY_TMPDIR`` may therefore point to a short symlink
+    (for example ``/tmp/nrl``) targeting that same large filesystem.
+    """
+    configured = os.environ.get("NOISE_RL_RAY_TMPDIR") or os.environ.get("TMPDIR")
+    if not configured:
+        return None
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise ValueError("TMPDIR and NOISE_RL_RAY_TMPDIR must be absolute paths")
+    ray_path = path / "ray"
+    socket_path = ray_path / _RAY_SOCKET_SUFFIX
+    if len(os.fsencode(str(socket_path))) > _UNIX_SOCKET_PATH_MAX:
+        raise ValueError(
+            "Ray temporary directory is too long for its Unix socket path. "
+            "Keep TMPDIR for FastDownward, then set NOISE_RL_RAY_TMPDIR to a short "
+            "absolute directory or symlink such as /tmp/nrl."
+        )
+    # Deliberately do not call resolve(): a short symlink is the intended way
+    # to use a deep project filesystem while retaining a short socket pathname.
+    path.mkdir(parents=True, exist_ok=True)
+    return str(ray_path)
+
+
 def main(entrypoint: str = "train.py"):
     import ray
 
@@ -64,11 +97,9 @@ def main(entrypoint: str = "train.py"):
     # Ray itself otherwise writes its session and object-spill files under
     # /tmp.  A user-provided TMPDIR makes one durable parent location for both
     # Ray and ALFWorld without forcing a storage choice on every deployment.
-    ray_tmpdir = os.environ.get("NOISE_RL_RAY_TMPDIR") or os.environ.get("TMPDIR")
+    ray_tmpdir = ray_temp_directory()
     if ray_tmpdir and ray_address == "local":
-        path = Path(ray_tmpdir).expanduser().resolve()
-        path.mkdir(parents=True, exist_ok=True)
-        ray_options["_temp_dir"] = str(path / "ray")
+        ray_options["_temp_dir"] = ray_tmpdir
     ray.init(**ray_options)
     swanlab_logger = None
     try:

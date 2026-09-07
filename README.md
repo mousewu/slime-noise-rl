@@ -158,10 +158,11 @@ ALFWorld 的 FastDownward 与 Ray 默认都会使用 `/tmp`。长跑前应把它
 
 ```bash
 TMPDIR=/data/noise-rl-tmp \
+NOISE_RL_RAY_TMPDIR=/tmp/nrl \
 bash scripts/train_fully_async.sh ...
 ```
 
-启动器会将这个 `TMPDIR` 传入 Ray worker 和 runner，并让本地 Ray session 写入 `$TMPDIR/ray`；不需修改 Slime 或本项目源码。若显式使用远程 Ray cluster，则由集群管理员配置 Ray 的临时目录，`TMPDIR` 仍会传给 ALFWorld runner。
+启动器会将 `TMPDIR` 传入 Ray worker 和 runner，并让本地 Ray session 写入 `NOISE_RL_RAY_TMPDIR/ray`。Ray 的 Unix socket 全路径不能超过 107 字节，因此项目目录很深时必须使用短路径；`/tmp/nrl` 可以是指向大容量盘目录的软链接。不要让它被 Python 解析为长的真实路径。若显式使用远程 Ray cluster，则由集群管理员配置 Ray 的临时目录，`TMPDIR` 仍会传给 ALFWorld runner。
 
 先检查命令，不启动 Ray/GPU，也不创建实验输出目录：
 

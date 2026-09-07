@@ -446,6 +446,9 @@ def main(argv=None, fully_async=False):
     env.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
     env.setdefault("NVTE_FUSED_ATTN", "0")
     env.setdefault("NVTE_FLASH_ATTN", "1")
+    # Ray sessions can be ephemeral or live on a remote head node.  Preserve
+    # actionable worker/engine errors with the experiment artifacts as well.
+    env["NOISE_RL_RAY_DIAGNOSTICS_PATH"] = str(output / "ray_diagnostics.log")
     env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
     if args.deterministic:
         env.update(NCCL_ALGO="Ring", NVTE_ALLOW_NONDETERMINISTIC_ALGO="0", CUBLAS_WORKSPACE_CONFIG=":4096:8")

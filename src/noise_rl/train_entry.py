@@ -1,6 +1,7 @@
 """Initialize an isolated Ray runtime with explicit project imports, then enter Slime."""
 
 import json
+import logging
 import os
 import runpy
 import sys
@@ -44,6 +45,7 @@ def ray_temp_directory() -> str | None:
 def main(entrypoint: str = "train.py"):
     import ray
 
+    from .ray_log_mirror import start_ray_log_mirror
     from .swanlab_bridge import (
         SWANLAB_ACTOR_ENV,
         SWANLAB_CONFIG_ENV,
@@ -101,6 +103,18 @@ def main(entrypoint: str = "train.py"):
     if ray_tmpdir and ray_address == "local":
         ray_options["_temp_dir"] = ray_tmpdir
     ray.init(**ray_options)
+    if ray_address == "local":
+        ray_log_mirror = start_ray_log_mirror(
+            ray_tmpdir,
+            audit_path=os.environ.get("NOISE_RL_RAY_DIAGNOSTICS_PATH"),
+        )
+    else:
+        logging.getLogger(__name__).warning(
+            "Ray diagnostic mirror is unavailable for remote RAY_ADDRESS=%s; "
+            "inspect the Ray head node logs",
+            ray_address,
+        )
+        ray_log_mirror = None
     swanlab_logger = None
     try:
         if swanlab_settings:
@@ -113,13 +127,20 @@ def main(entrypoint: str = "train.py"):
     finally:
         training_failed = sys.exc_info()[0] is not None
         try:
+            if ray_log_mirror is not None:
+                ray_log_mirror.poll_once()
             # Explicit finish means "Completed" in SwanLab. On an exception,
             # leave the run unfinished so the service can classify it as an
             # interrupted/crashed experiment instead of a successful one.
             if swanlab_logger is not None and not training_failed:
                 ray.get(swanlab_logger.finish.remote(), timeout=60)
         finally:
-            ray.shutdown()
+            try:
+                ray.shutdown()
+            finally:
+                if ray_log_mirror is not None:
+                    ray_log_mirror.poll_once()
+                    ray_log_mirror.stop()
 
 
 if __name__ == "__main__":

@@ -274,6 +274,8 @@ bash scripts/train.sh \
 
 启用 SwanLab 后，项目还会将每个 Ray worker 的 Python `INFO`、`WARNING`、`ERROR` 日志非阻塞镜像到 SwanLab 的 Logs 页；原始 Ray 日志仍保留在 Ray session 目录。本地 `swanlab/forwarded_logs.jsonl` 是镜像日志的完整审计副本，`metric_events.jsonl` 则保存标量指标。为减少噪声或上传量，可在启动前设置 `NOISE_RL_SWANLAB_LOG_LEVEL=WARNING`（默认 `INFO`）。`SWANLAB_API_KEY`、`HF_TOKEN` 和 `HUGGING_FACE_HUB_TOKEN` 出现在日志文本时会被脱敏。
 
+无论是否启用 SwanLab，启动入口都会在本地 Ray session 可见时，持续将 `ERROR`、Traceback、CUDA/OOM、SGLang abort 和 worker/driver 崩溃等日志附上下文转发到训练主日志；相同内容还会写入运行目录的 `ray_diagnostics.log`，因此后续调试不依赖 `/tmp/ray`。默认每秒轮询一次；可用 `NOISE_RL_RAY_LOG_MIRROR=0` 关闭，或用 `NOISE_RL_RAY_LOG_POLL_SECONDS=2` 调整频率。连接远程 Ray cluster 时日志仍由 head 节点管理，镜像器会在主日志中明确提示本地 session 不可见。
+
 运行目录包含：
 
 - `run.json`、`runtime_config.json`：启动命令、Slime版本、完整实验参数。

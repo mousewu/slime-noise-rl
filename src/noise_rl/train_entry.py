@@ -35,6 +35,10 @@ def main(entrypoint: str = "train.py"):
         k: os.environ[k]
         for k in (
             "PYTHONPATH",
+            # FastDownward (called by TextWorld) and the process-isolated
+            # environment runners inherit this location from the Ray worker.
+            "TMPDIR",
+            "NOISE_RL_RAY_TMPDIR",
             "CUDA_DEVICE_MAX_CONNECTIONS",
             "NVTE_FUSED_ATTN",
             "NVTE_FLASH_ATTN",
@@ -51,11 +55,21 @@ def main(entrypoint: str = "train.py"):
     runtime_env = {"env_vars": propagated}
     if swanlab_settings:
         runtime_env["worker_process_setup_hook"] = setup_worker
-    ray.init(
-        address=os.environ.get("RAY_ADDRESS", "local"),
-        runtime_env=runtime_env,
-        log_to_driver=True,
-    )
+    ray_address = os.environ.get("RAY_ADDRESS", "local")
+    ray_options = {
+        "address": ray_address,
+        "runtime_env": runtime_env,
+        "log_to_driver": True,
+    }
+    # Ray itself otherwise writes its session and object-spill files under
+    # /tmp.  A user-provided TMPDIR makes one durable parent location for both
+    # Ray and ALFWorld without forcing a storage choice on every deployment.
+    ray_tmpdir = os.environ.get("NOISE_RL_RAY_TMPDIR") or os.environ.get("TMPDIR")
+    if ray_tmpdir and ray_address == "local":
+        path = Path(ray_tmpdir).expanduser().resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        ray_options["_temp_dir"] = str(path / "ray")
+    ray.init(**ray_options)
     swanlab_logger = None
     try:
         if swanlab_settings:

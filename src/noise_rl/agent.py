@@ -8,6 +8,10 @@ from threading import Lock
 import httpx
 
 from .config import ExperimentConfig
+from .environment_runners import (
+    ProcessIsolatedALFWorldEnvironment,
+    get_process_environment_pool,
+)
 from .envs import ALFWorldEnvironment, make_environment, parse_action
 from .noise import NoisyEnvironment, execute_with_retry
 from .sampling import SamplingPlan, stable_seed
@@ -45,6 +49,14 @@ def environment_executor(workers: int) -> ThreadPoolExecutor:
 def _is_alfworld_environment(env: NoisyEnvironment) -> bool:
     """Whether a (possibly noisy) environment uses TextWorld underneath."""
     return isinstance(getattr(env, "env", env), ALFWorldEnvironment)
+
+
+def _environment_dispatch_workers(env: NoisyEnvironment, workers: int) -> int:
+    """Keep enough RPC threads to occupy every leased process runner."""
+    raw_environment = getattr(env, "env", env)
+    if isinstance(raw_environment, ProcessIsolatedALFWorldEnvironment):
+        return max(workers, raw_environment.runner_count)
+    return workers
 
 
 def create_environment(task: dict, environment_factory):
@@ -117,13 +129,64 @@ async def execute_environment_step(
     queued = time.monotonic()
     loop = asyncio.get_running_loop()
     result, started, finished = await loop.run_in_executor(
-        environment_executor(workers),
+        environment_executor(_environment_dispatch_workers(env, workers)),
         _execute_environment_step,
         env,
         action,
         retry_limit,
     )
     return result, started - queued, finished - started
+
+
+async def create_episode_environment(
+    task: dict,
+    config: ExperimentConfig,
+    environment_factory,
+):
+    """Create a backend without blocking the rollout loop.
+
+    Process runners are deliberately limited to real ALFWorld tasks produced by
+    the built-in factory.  Test fixtures and other backends keep the established
+    in-process semantics.
+    """
+    if (
+        config.environment_processes
+        and task.get("environment") == "alfworld"
+        and environment_factory is make_environment
+    ):
+        return await get_process_environment_pool(config.environment_processes).open(task)
+    loop = asyncio.get_running_loop()
+    environment = await loop.run_in_executor(
+        environment_executor(config.environment_workers),
+        create_environment,
+        task,
+        environment_factory,
+    )
+    return environment, 0.0
+
+
+async def reset_episode_environment(env: NoisyEnvironment, workers: int):
+    """Reset through bounded workers so a runner RPC cannot stall asyncio."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        environment_executor(_environment_dispatch_workers(env, workers)),
+        reset_environment,
+        env,
+    )
+
+
+async def close_episode_environment(env: NoisyEnvironment, workers: int) -> None:
+    """Return a process runner lease without blocking unrelated trajectories."""
+    raw_environment = getattr(env, "env", env)
+    if isinstance(raw_environment, ProcessIsolatedALFWorldEnvironment):
+        await raw_environment.aclose()
+        return
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(
+        environment_executor(_environment_dispatch_workers(env, workers)),
+        close_environment,
+        env,
+    )
 
 
 @dataclass
@@ -160,6 +223,7 @@ class Trajectory:
     model_request_seconds: float = 0.0
     environment_queue_seconds: float = 0.0
     environment_step_seconds: float = 0.0
+    environment_runner_wait_seconds: float = 0.0
     in_flight_episodes_at_start: int = 0
 
     @property
@@ -286,14 +350,18 @@ async def run_episode(
     started = time.monotonic()
     with EpisodeActivity() as in_flight_at_start:
         protocol = QwenChatProtocol(tokenizer)
-        env = NoisyEnvironment(
-            create_environment(task, environment_factory),
-            config.noise,
-            plan.environment_seed,
-            config.max_tool_calls,
-        )
+        env = None
         try:
-            initial = reset_environment(env)
+            environment, runner_wait_seconds = await create_episode_environment(
+                task, config, environment_factory
+            )
+            env = NoisyEnvironment(
+                environment,
+                config.noise,
+                plan.environment_seed,
+                config.max_tool_calls,
+            )
+            initial = await reset_episode_environment(env, config.environment_workers)
             if initial.success or initial.terminated or initial.truncated:
                 raise ValueError("Task must start in a nonterminal, unsolved state")
             prompt, prompt_tokens = protocol.initial(initial.observation)
@@ -302,7 +370,10 @@ async def run_episode(
                     f"Initial prompt exceeds the context budget: {task['id']}"
                 )
             trajectory = Trajectory(
-                prompt, prompt_tokens, in_flight_episodes_at_start=in_flight_at_start
+                prompt,
+                prompt_tokens,
+                in_flight_episodes_at_start=in_flight_at_start,
+                environment_runner_wait_seconds=runner_wait_seconds,
             )
             params = dict(
                 sampling_params or {"temperature": 0.8, "top_p": 1.0, "top_k": -1}
@@ -428,4 +499,5 @@ async def run_episode(
             trajectory.elapsed_seconds = time.monotonic() - started
             return trajectory
         finally:
-            close_environment(env)
+            if env is not None:
+                await close_episode_environment(env, config.environment_workers)

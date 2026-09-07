@@ -148,7 +148,20 @@ noise-rl prepare --environment alfworld \
 
 默认：单节点8卡、训练 TP=2、4个双卡 rollout engine、colocate、8K上下文、每条轨迹最多2048个模型生成 token、单次输出最多96 token、40个模型回合、50次环境调用。故障概率默认 action-drop=0.15、observation-loss=0.10。
 
-`concurrency` 是全局 SGLang 请求容量：主配置设为 32，在 8 卡、每个 engine 2 卡时对应每个 rollout engine 8 条并发请求。`environment_workers` 则将同步环境调用移出 asyncio 事件循环。ALFWorld 的 TextWorld/Tatsu 解析器不是线程安全的，因此项目会在每个 rollout worker 内串行化真实 ALFWorld 的创建、`reset`、`step` 和 `close`；默认设为 `environment_workers: 1`，不能通过增加线程数安全地提高 ALFWorld step 并行度。单条轨迹始终严格遵循“生成一个动作 → 执行一个环境 step → 接收观察”的顺序。若要使 ALFWorld 环境本身跨轨迹并行，必须使用进程隔离的环境 runner，而不是线程池。
+`concurrency` 是全局 SGLang 请求容量：主配置设为 32，在 8 卡、每个 engine 2 卡时对应每个 rollout engine 8 条并发请求。`environment_workers` 只服务于普通的进程内同步环境调用。
+
+ALFWorld 默认启用 `environment_processes: 32`。它在**每个 RolloutManager** 内创建最多 32 个 CPU-only runner；一条活跃轨迹从创建、`reset`、多次 `step` 到 `close` 始终独占其中一个 runner。这样，同一轨迹仍严格遵循“模型生成一个动作 → 环境执行一个动作 → 模型接收观察”的顺序，但不同轨迹的真实 TextWorld/ALFWorld step 可以跨进程并行，不会共享 Tatsu 的非线程安全解析器。故障注入、重试、工具调用计数和奖励仍留在 rollout 父进程：被 action-drop 的动作不会发送给 runner，observation-loss 发生在真实 step 返回后，因此实验语义不变。
+
+`environment_processes` 是环境并行上限，不是 SGLang 的 `concurrency`。项目会自动把 ALFWorld RPC 的线程容量提高到该数值；不需要为了它再增大 `environment_workers`。这些 runner 是项目在 rollout worker 内启动的 CPU 子进程，不会被 Ray 的 GPU 调度自动计入 CPU 资源：配置 32 前应确认每个 RolloutManager 有至少约 32 个可用 CPU 核和足够内存。如果主机 CPU 或内存不足，可先改为 16；如果 `rollout/environment_runner_wait_seconds` 长期接近 0 而 GPU 仍空闲，瓶颈就不再是可用 runner 数，而更可能是模型请求并发、轨迹长度或训练/rollout 拓扑。
+
+ALFWorld 的 FastDownward 与 Ray 默认都会使用 `/tmp`。长跑前应把它们移到有足够空间的本地盘，例如：
+
+```bash
+TMPDIR=/data/noise-rl-tmp \
+bash scripts/train_fully_async.sh ...
+```
+
+启动器会将这个 `TMPDIR` 传入 Ray worker 和 runner，并让本地 Ray session 写入 `$TMPDIR/ray`；不需修改 Slime 或本项目源码。若显式使用远程 Ray cluster，则由集群管理员配置 Ray 的临时目录，`TMPDIR` 仍会传给 ALFWorld runner。
 
 先检查命令，不启动 Ray/GPU，也不创建实验输出目录：
 

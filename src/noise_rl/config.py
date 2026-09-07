@@ -39,6 +39,9 @@ class ExperimentConfig:
     request_timeout: float = 180.0
     concurrency: int = 16
     environment_workers: int = 8
+    # Zero preserves the thread-based backend.  A positive value gives
+    # ALFWorld trajectories process-isolated, stateful environment runners.
+    environment_processes: int = 0
     retry_limit: int = 0
     trace_dir: str | None = None
 
@@ -63,6 +66,8 @@ class ExperimentConfig:
             value = getattr(self, name)
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if type(self.environment_processes) is not int or self.environment_processes < 0:
+            raise ValueError("environment_processes must be a nonnegative integer")
         if self.group_size < 2 or self.group_size % self.scenarios:
             raise ValueError("group_size must be >=2 and divisible by scenarios")
         if self.method == "matched" and self.group_size // self.scenarios < 2:

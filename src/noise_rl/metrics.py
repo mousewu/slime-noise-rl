@@ -16,7 +16,7 @@ def episode_record(
     checkpoint=None,
 ):
     return {
-        "schema": 2,
+        "schema": 3,
         "plan": plan.to_dict(),
         "config": config.to_dict(),
         "checkpoint": checkpoint,
@@ -31,6 +31,7 @@ def episode_record(
         "model_request_seconds": trajectory.model_request_seconds,
         "environment_queue_seconds": trajectory.environment_queue_seconds,
         "environment_step_seconds": trajectory.environment_step_seconds,
+        "environment_runner_wait_seconds": trajectory.environment_runner_wait_seconds,
         "in_flight_episodes_at_start": trajectory.in_flight_episodes_at_start,
         "turns": len([s for s in trajectory.segments if s.trainable]),
         "format_errors": sum(step["format_error"] for step in trajectory.steps),
@@ -148,6 +149,12 @@ def trace_metrics(
         ),
         f"{prefix}/environment_queue_seconds/total": sum(
             record.get("environment_queue_seconds", 0.0) for record in records
+        ),
+        f"{prefix}/environment_runner_wait_seconds/mean": mean(
+            record.get("environment_runner_wait_seconds", 0.0) for record in records
+        ),
+        f"{prefix}/environment_runner_wait_seconds/total": sum(
+            record.get("environment_runner_wait_seconds", 0.0) for record in records
         ),
         f"{prefix}/in_flight_episodes_at_start/mean": mean(
             record.get("in_flight_episodes_at_start", 1) for record in records

@@ -7,10 +7,13 @@ noise_rl:
   # Global SGLang request capacity.  With 8 GPUs and 2 GPUs per engine, this
   # becomes 8 concurrent requests for each of the 4 rollout engines.
   concurrency: 32
-  # One ALFWorld/TextWorld step is parser-serialized per rollout worker because
-  # TextWorld's grammar parser is not thread-safe.  The worker thread still
-  # keeps this wait from blocking the asyncio loop.
+  # Legacy in-process environment RPC workers.  Process runners below raise
+  # the actual RPC capacity to their own count for ALFWorld.
   environment_workers: 1
+  # Each live ALFWorld trajectory leases one stateful TextWorld process.  This
+  # permits 32 trajectories to execute genuine environment steps in parallel
+  # without sharing TextWorld's non-thread-safe parser.
+  environment_processes: 32
   noise:
     action_drop: 0.15
     observation_loss: 0.10

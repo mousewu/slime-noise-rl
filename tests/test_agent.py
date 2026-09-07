@@ -19,6 +19,7 @@ from noise_rl.agent import (
 )
 from noise_rl.config import ExperimentConfig, NoiseConfig
 from noise_rl.envs import ALFWorldEnvironment, StepResult
+from noise_rl.environment_runners import ProcessEnvironmentPool
 from noise_rl.fixtures import ByteTokenizer, ScriptedClient
 from noise_rl.noise import NoisyEnvironment
 from noise_rl.sampling import plan_sample
@@ -168,6 +169,33 @@ def test_textworld_lifecycle_is_serialized_with_steps():
             executor.shutdown(wait=True)
 
     assert all(elapsed >= 0.09 for elapsed in asyncio.run(execute()))
+
+
+def test_process_runner_leases_state_to_distinct_environment_processes():
+    async def execute():
+        pool = ProcessEnvironmentPool(2)
+        first = second = None
+        try:
+            task = {"environment": "mini", "item": "apple 1", "target": "table 1"}
+            first, second = await asyncio.gather(pool.open(task), pool.open(task))
+            first, first_wait = first
+            second, second_wait = second
+            assert first.runner_index != second.runner_index
+            assert first_wait >= 0 and second_wait >= 0
+            await asyncio.gather(
+                asyncio.to_thread(first.reset), asyncio.to_thread(second.reset)
+            )
+            await asyncio.to_thread(first.step, "take apple 1 from shelf 1")
+            inventory = await asyncio.to_thread(second.step, "inventory")
+            return inventory
+        finally:
+            if first is not None:
+                await first.aclose()
+            if second is not None:
+                await second.aclose()
+            pool.shutdown()
+
+    assert "nothing" in asyncio.run(execute()).observation.lower()
 
 
 def test_special_tokens_in_observation_are_escaped():

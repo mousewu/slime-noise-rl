@@ -7,8 +7,12 @@ noise_rl:
   # Default 8-GPU async topology reserves 4 GPUs for training and 4 for two
   # TP=2 rollout engines. Slime therefore maintains 8 x 2 = 16 groups in flight.
   concurrency: 16
-  # TextWorld/Tatsu is parser-serialized inside each rollout worker.
+  # Legacy in-process environment RPC workers.  Process runners below raise
+  # the actual RPC capacity to their own count for ALFWorld.
   environment_workers: 1
+  # Per RolloutManager: one leased TextWorld process per live ALFWorld
+  # trajectory, so up to 32 real environment steps can proceed in parallel.
+  environment_processes: 32
   noise:
     action_drop: 0.15
     observation_loss: 0.10

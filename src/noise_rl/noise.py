@@ -23,8 +23,9 @@ class EventNoise:
     def uniform(self, channel: str, action: str, attempt: int) -> float:
         return (stable_seed(self.seed, channel, action, attempt) >> 11) / 2**53
 
-    def event(self, action: str, read_only: bool) -> dict:
-        action = canonical_action(action)
+    def event(self, action: str, read_only: bool, *, canonicalized=False) -> dict:
+        if not canonicalized:
+            action = canonical_action(action)
         attempt = self.attempts[action]
         self.attempts[action] += 1
         block = attempt // self.config.burst_length
@@ -60,8 +61,8 @@ class NoisyEnvironment:
         if self.done:
             raise RuntimeError("Cannot step a finished environment")
         self.calls += 1
-        action = canonical_action(action)
-        event = self.oracle.event(action, self.env.is_read_only(action))
+        action = getattr(self.env, "canonical_action", canonical_action)(action)
+        event = self.oracle.event(action, self.env.is_read_only(action), canonicalized=True)
         if event["dropped"]:
             result = StepResult(NOT_EXECUTED, info={"retryable": True})
         else:

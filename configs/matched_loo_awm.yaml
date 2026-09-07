@@ -1,0 +1,13 @@
+noise_rl:
+  method: matched
+  group_size: 8
+  scenarios: 2
+  baseline: loo
+  concurrency: 32
+  environment_workers: 32
+  environment_processes: 0
+  awm_url: http://127.0.0.1:8899
+  max_tokens_per_turn: 256
+  noise:
+    action_drop: 0.15
+    observation_loss: 0.10

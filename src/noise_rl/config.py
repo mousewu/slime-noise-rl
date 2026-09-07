@@ -42,6 +42,7 @@ class ExperimentConfig:
     # Zero preserves the thread-based backend.  A positive value gives
     # ALFWorld trajectories process-isolated, stateful environment runners.
     environment_processes: int = 0
+    awm_url: str | None = None
     retry_limit: int = 0
     trace_dir: str | None = None
 

@@ -350,12 +350,22 @@ def main(argv=None, fully_async=False):
         seed=args.seed,
         trace_dir=str(Path(args.output).expanduser().resolve() / "traces"),
     )
+    if os.environ.get("AWM_URL"):
+        config = replace(config, awm_url=os.environ["AWM_URL"])
     if args.max_tokens_per_gpu < config.max_context_tokens:
         raise ValueError("max-tokens-per-gpu must accommodate one full trajectory context")
     slime_commit = verify_slime(args.slime_dir, "train_async.py" if fully_async else "train.py")
     validate_local_checkpoints(args.hf_checkpoint, args.megatron_checkpoint)
     training = read_records(args.data)
     validate_local_records(training)
+    if any(r["metadata"]["task"]["environment"] == "awm" for r in training):
+        if not config.awm_url:
+            raise ValueError("AWM manifest requires noise_rl.awm_url")
+        if not args.dry_run:
+            try:
+                from agent_world_model_env import AWMEnv  # noqa: F401
+            except ImportError as exc:
+                raise RuntimeError("AWM requires the prepared OpenEnv src and envs directories on PYTHONPATH; see docs/AWM.md") from exc
     if any(r["metadata"]["task"].get("split") != "train" for r in training):
         raise ValueError("Training tasks must be from split=train")
     if args.eval_data:

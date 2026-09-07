@@ -37,8 +37,15 @@ def read_records(path: str | Path) -> list[dict]:
                 task = record["metadata"]["task"]
                 if not isinstance(task["id"], str) or not task["id"]:
                     raise ValueError("Task id must be nonempty")
-                if task["environment"] not in {"mini", "alfworld"}:
+                if task["environment"] not in {"mini", "alfworld", "awm"}:
                     raise ValueError("Unknown environment")
+                if task["environment"] == "awm":
+                    if not isinstance(task.get("scenario"), str) or not task["scenario"]:
+                        raise ValueError("AWM requires scenario")
+                    if type(task.get("task_idx")) is not int or task["task_idx"] < 0:
+                        raise ValueError("AWM requires nonnegative task_idx")
+                    if not isinstance(task.get("read_only_tools", []), list) or not all(isinstance(t, str) for t in task.get("read_only_tools", [])):
+                        raise ValueError("read_only_tools must be a list of names")
                 if task["environment"] == "alfworld" and not Path(task["gamefile"]).is_absolute():
                     raise ValueError("ALFWorld gamefile must be an absolute path")
                 records.append(record)

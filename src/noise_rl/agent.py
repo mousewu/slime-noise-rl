@@ -149,6 +149,12 @@ async def create_episode_environment(
     the built-in factory.  Test fixtures and other backends keep the established
     in-process semantics.
     """
+    if task.get("environment") == "awm":
+        from .awm import AWMEnvironment
+
+        if not config.awm_url:
+            raise ValueError("AWM tasks require noise_rl.awm_url")
+        return AWMEnvironment(task, config.awm_url, config.request_timeout), 0.0
     if (
         config.environment_processes
         and task.get("environment") == "alfworld"
@@ -268,9 +274,9 @@ class QwenChatProtocol:
         # Environment text must not be interpreted as chat control tokens.
         return text.replace("<|", "< |")
 
-    def initial(self, observation):
+    def initial(self, observation, system_prompt=SYSTEM_PROMPT):
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": self.safe_observation(observation)},
         ]
         text = self.tokenizer.apply_chat_template(
@@ -364,7 +370,11 @@ async def run_episode(
             initial = await reset_episode_environment(env, config.environment_workers)
             if initial.success or initial.terminated or initial.truncated:
                 raise ValueError("Task must start in a nonterminal, unsolved state")
-            prompt, prompt_tokens = protocol.initial(initial.observation)
+            if task.get("environment") == "awm":
+                from .awm import SYSTEM_PROMPT as awm_prompt
+                prompt, prompt_tokens = protocol.initial(initial.observation, awm_prompt)
+            else:
+                prompt, prompt_tokens = protocol.initial(initial.observation)
             if len(prompt_tokens) >= config.max_context_tokens:
                 raise ValueError(
                     f"Initial prompt exceeds the context budget: {task['id']}"
@@ -443,7 +453,11 @@ async def run_episode(
                     )
                 response_text = protocol.action_text(generated.tokens)
                 try:
-                    action = parse_action(response_text)
+                    if task.get("environment") == "awm":
+                        from .awm import canonical_action
+                        action = canonical_action(response_text)
+                    else:
+                        action = parse_action(response_text)
                 except ValueError as exc:
                     observation = f"FORMAT_ERROR: {exc}"
                     trajectory.steps.append(

@@ -1,0 +1,23 @@
+noise_rl:
+  method: matched
+  group_size: 8
+  scenarios: 2
+  baseline: loo
+  std_normalization: false
+  # One TP=2 rollout engine; 16 concurrent model requests/groups keeps up to
+  # roughly 128 stateful AWM trajectory sessions alive (16 groups x 8 samples).
+  concurrency: 16
+  environment_workers: 32
+  environment_processes: 0
+  # Override at launch with AWM_URL when the service is not local.
+  awm_url: http://127.0.0.1:8899
+  max_turns: 40
+  max_tool_calls: 50
+  max_context_tokens: 8192
+  max_generated_tokens: 2048
+  max_tokens_per_turn: 256
+  request_timeout: 180
+  retry_limit: 0
+  noise:
+    action_drop: 0.15
+    observation_loss: 0.10

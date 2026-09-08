@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -14,7 +16,11 @@ from .environment_runners import (
 )
 from .envs import ALFWorldEnvironment, make_environment, parse_action
 from .noise import NoisyEnvironment, execute_with_retry
+from .rollout_diagnostics import weight_update_snapshot
 from .sampling import SamplingPlan, stable_seed
+
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You control a text household environment. Complete the task using its commands.
 Reply with exactly one JSON object: {"action":"<one environment command>"}.
@@ -32,6 +38,12 @@ _ENVIRONMENT_EXECUTORS_LOCK = Lock()
 _EPISODE_ACTIVITY_LOCK = Lock()
 _TEXTWORLD_STEP_LOCK = Lock()
 _IN_FLIGHT_EPISODES = 0
+
+
+def in_flight_episode_count() -> int:
+    """Return the current process-local number of live agent trajectories."""
+    with _EPISODE_ACTIVITY_LOCK:
+        return _IN_FLIGHT_EPISODES
 
 
 def environment_executor(workers: int) -> ThreadPoolExecutor:
@@ -202,6 +214,7 @@ class Generation:
     text: str
     finish_reason: str
     meta_info: dict = field(default_factory=dict)
+    request_id: str | None = None
 
 
 @dataclass
@@ -338,7 +351,21 @@ class SGLangClient:
             raise ValueError("Invalid rollout log probabilities")
         finish = meta.get("finish_reason", {})
         reason = finish.get("type") if isinstance(finish, dict) else finish
-        return Generation(ids, probs, data.get("text", ""), reason, meta)
+        request_id = (
+            data.get("id")
+            or meta.get("request_id")
+            or meta.get("id")
+            or meta.get("rid")
+            or response.headers.get("x-request-id")
+        )
+        return Generation(
+            ids,
+            probs,
+            data.get("text", ""),
+            reason,
+            meta,
+            str(request_id) if request_id is not None else None,
+        )
 
     async def close(self):
         await self.client.aclose()
@@ -417,8 +444,9 @@ async def run_episode(
                 )
                 model_started = time.monotonic()
                 generated = await client.generate(token_ids, call_params)
+                request_elapsed_seconds = time.monotonic() - model_started
                 trajectory.model_requests += 1
-                trajectory.model_request_seconds += time.monotonic() - model_started
+                trajectory.model_request_seconds += request_elapsed_seconds
                 if not generated.tokens or len(generated.tokens) != len(
                     generated.log_probs
                 ):
@@ -438,6 +466,36 @@ async def run_episode(
                     )
                 )
                 if generated.finish_reason == "abort":
+                    abort_diagnostics = {
+                        "event": "sglang_inference_abort",
+                        "task_id": plan.task_id,
+                        "group_id": plan.group_id,
+                        "rank": plan.rank,
+                        "scenario_id": plan.scenario_id,
+                        "evaluation": plan.evaluation,
+                        "turn": turn,
+                        "request": {
+                            "request_id": generated.request_id,
+                            "url": getattr(client, "url", None),
+                            "finish_reason": generated.finish_reason,
+                            "meta_info": generated.meta_info,
+                            "input_tokens": len(token_ids),
+                            "output_tokens": len(generated.tokens),
+                            "max_new_tokens": remaining,
+                            "elapsed_seconds": request_elapsed_seconds,
+                            "episode_elapsed_seconds": trajectory.model_request_seconds,
+                        },
+                        "episode": {
+                            "model_requests": trajectory.model_requests,
+                            "in_flight_episodes_at_start": in_flight_at_start,
+                            "in_flight_episodes_at_abort": in_flight_episode_count(),
+                        },
+                        "weight_update": weight_update_snapshot(),
+                    }
+                    logger.error(
+                        "SGLang abort diagnostics: %s",
+                        json.dumps(abort_diagnostics, ensure_ascii=False, sort_keys=True, default=str),
+                    )
                     raise RuntimeError(
                         "Inference was aborted; do not turn infrastructure failures into zero reward"
                     )

@@ -1,4 +1,6 @@
 import asyncio
+import json
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -264,6 +266,39 @@ def test_missing_stop_token_fails_closed(task):
         run(task, client=BrokenClient())
 
 
+def test_aborted_inference_logs_complete_diagnostics(task, caplog, monkeypatch):
+    class AbortedClient:
+        url = "http://sglang.example/generate"
+
+        async def generate(self, *args):
+            return Generation(
+                [151645],
+                [-0.2],
+                "<|im_end|>",
+                "abort",
+                {"finish_reason": {"type": "abort"}, "request_id": "meta-request"},
+                "top-level-request",
+            )
+
+    monkeypatch.setattr(
+        "noise_rl.agent.weight_update_snapshot",
+        lambda: {"scope": "current_process_timer_log", "observed": True, "active": True},
+    )
+    caplog.set_level(logging.ERROR, logger="noise_rl.agent")
+
+    with pytest.raises(RuntimeError, match="Inference was aborted"):
+        run(task, client=AbortedClient())
+
+    message = next(
+        record.message for record in caplog.records if record.message.startswith("SGLang abort diagnostics: ")
+    )
+    payload = json.loads(message.removeprefix("SGLang abort diagnostics: "))
+    assert payload["request"]["request_id"] == "top-level-request"
+    assert payload["request"]["meta_info"]["request_id"] == "meta-request"
+    assert payload["episode"]["in_flight_episodes_at_abort"] == 1
+    assert payload["weight_update"]["active"] is True
+
+
 def test_native_sglang_http_contract():
     seen = []
 
@@ -274,6 +309,7 @@ def test_native_sglang_http_contract():
         return httpx.Response(
             200,
             json={
+                "id": "sglang-request-7",
                 "text": "x",
                 "meta_info": {
                     "output_token_logprobs": [
@@ -296,4 +332,5 @@ def test_native_sglang_http_contract():
 
     result = asyncio.run(execute())
     assert result.tokens == [3, 151645] and result.log_probs == [-0.2, -0.4]
+    assert result.request_id == "sglang-request-7"
     assert seen[0]["input_ids"] == [1, 2] and seen[0]["return_logprob"] is True

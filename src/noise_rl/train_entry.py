@@ -46,6 +46,7 @@ def main(entrypoint: str = "train.py"):
     import ray
 
     from .ray_log_mirror import start_ray_log_mirror
+    from .rollout_diagnostics import install_slime_timer_patch
     from .swanlab_bridge import (
         SWANLAB_ACTOR_ENV,
         SWANLAB_CONFIG_ENV,
@@ -87,9 +88,7 @@ def main(entrypoint: str = "train.py"):
         )
         if k in os.environ
     }
-    runtime_env = {"env_vars": propagated}
-    if swanlab_settings:
-        runtime_env["worker_process_setup_hook"] = setup_worker
+    runtime_env = {"env_vars": propagated, "worker_process_setup_hook": setup_worker}
     ray_address = os.environ.get("RAY_ADDRESS", "local")
     ray_options = {
         "address": ray_address,
@@ -103,6 +102,7 @@ def main(entrypoint: str = "train.py"):
     if ray_tmpdir and ray_address == "local":
         ray_options["_temp_dir"] = ray_tmpdir
     ray.init(**ray_options)
+    install_slime_timer_patch()
     if ray_address == "local":
         ray_log_mirror = start_ray_log_mirror(
             ray_tmpdir,

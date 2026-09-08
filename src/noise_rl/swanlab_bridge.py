@@ -260,5 +260,8 @@ def install_slime_logging_patch() -> None:
 
 def setup_worker() -> None:
     """Ray runtime-env hook executed before Slime actors and tasks are loaded."""
+    from .rollout_diagnostics import install_slime_timer_patch
+
+    install_slime_timer_patch()
     if os.environ.get(SWANLAB_CONFIG_ENV):
         install_slime_logging_patch()

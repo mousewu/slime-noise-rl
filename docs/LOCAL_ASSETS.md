@@ -65,6 +65,12 @@ unzip /path/to/json_2.1.3_tw-pddl.zip -d /datasets/alfworld
 - `seq2seq_data.zip`；
 - 单独的 `json_2.1.1_pddl.zip`（本项目直接执行已生成的 `game.tw-pddl`）。
 
+### 用于专家 SFT 的本地轨迹
+
+不需要额外下载 `seq2seq_data.zip` 或从 ALFRED 另行抽取动作。每个由官方 planner 生成、且 `solvable: true` 的 `game.tw-pddl` 已包含 `walkthrough`：这是该 PDDL game 的可执行专家 command 序列。本项目的 `scripts/build_alfworld_expert_sft.sh` 只读取该字段，再通过本地 TextWorld 游戏回放；回放成功后才写入一个新的 Slime SFT JSONL。因此除了上面列出的 `traj_data.json` 和 `game.tw-pddl` 外，没有新增数据下载要求。
+
+默认应保持 `SFT_PLANNER_FALLBACK=0`。若某些游戏的 `walkthrough` 缺失、且你确认本机已有完整的 ALFWorld/TextWorld planner 依赖，可显式设为 `1`：它只在内存中查询本地 PDDL planner，不改写原始 game，但会增加 CPU/临时目录开销。无论哪种来源，构建报告都会记录各来源数量及跳过原因；训练只接受 `train` split 的记录。
+
 不要把原始数据提交到本仓库。manifest 保存绝对路径和游戏文件 SHA256，所以应在最终训练机器上生成；如果移动了数据目录，请重新生成 manifest。
 
 ```bash

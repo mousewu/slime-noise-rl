@@ -82,3 +82,37 @@ def check_gpu_runtime(hf_checkpoint, megatron_checkpoint, gpus):
             }
         )
     )
+
+
+def check_sft_gpu_runtime(hf_checkpoint, megatron_checkpoint, gpus):
+    """Validate the Slime/Megatron dependencies needed by offline SFT only.
+
+    SFT uses Slime's rule-based ``sft_rollout`` to construct token/loss masks.
+    It does not start SGLang or require FlashInfer, so keeping this check
+    separate lets a fresh warm-start run fail only on dependencies it uses.
+    """
+    validate_local_checkpoints(hf_checkpoint, megatron_checkpoint)
+    for name in ("torch", "ray", "megatron.core", "megatron.training", "transformer_engine"):
+        try:
+            importlib.import_module(name)
+        except ImportError as exc:
+            raise RuntimeError(
+                f"Missing SFT GPU runtime dependency: {name}; follow Slime's pinned setup"
+            ) from exc
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < gpus:
+        raise RuntimeError(f"Need {gpus} visible CUDA GPUs; local CPU tests do not verify training")
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError("This SFT recipe requires BF16 support")
+    print(
+        json.dumps(
+            {
+                "gpu_names": [torch.cuda.get_device_name(i) for i in range(gpus)],
+                "torch": torch.__version__,
+                "cuda": torch.version.cuda,
+                "mode": "offline_sft",
+                "warning": "Preflight checks dependencies, not end-to-end Megatron kernel correctness.",
+            }
+        )
+    )

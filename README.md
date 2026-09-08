@@ -144,6 +144,67 @@ noise-rl prepare --environment alfworld \
 
 `--limit 128` 可用于小规模预实验，按固定hash选择任务，避免只取字典序最前的一种任务类型；正式实验应记录任务分布。清单生成拒绝覆盖已有文件。`valid_seen`、`valid_unseen` 不允许作为训练清单。
 
+### ALFWorld 专家轨迹 SFT warm start
+
+直接用终局 binary reward 做 RL 时，早期策略经常得到全 0 比较组，无法产生稳定的 LOO/GRPO 学习信号。项目新增了一个与 RL **独立**的 Slime SFT 阶段，先让初始策略学会输出符合本 harness 的 JSON action，再以其 Megatron checkpoint 启动后续 RL。
+
+首选专家数据不是另一个格式不同的网页数据集，而是本地每个可解 `game.tw-pddl` 已保存的官方 PDDL planner `walkthrough`。ALFWorld 的官方 [`alfworld-generate --expert_type planner`](https://github.com/alfworld/alfworld/blob/master/scripts/alfworld-generate) 正是将 planner 的 `policy_commands` 写入该字段；本项目会再用与 RL 完全相同的 `ALFWorldEnvironment`（`AlfredDemangler(shuffle=False)`）逐条重放。**只有终局实际成功的轨迹才会进入 SFT 数据集。** 因而训练数据的 observation、动作字符串和 online harness 严格对齐，且构建过程不会联网、重新生成游戏或改写任何 `game.tw-pddl`。
+
+每个 Slime row 保留完整的多轮 history：system prompt 和每次 TextWorld observation 的 `step_loss_mask=0`，每条 `{"action":"..."}` 专家输出的 `step_loss_mask=1`。这使 SFT 只拟合 action token，而不会把环境回显当作模型应生成的文本。若极少数本地游戏没有 stored walkthrough，默认跳过并记录原因；仅在显式加 `--planner-fallback` 时才调用本地 PDDL planner，且仍必须通过同样的 TextWorld 重放验证。
+
+[`ALFRED`](https://arxiv.org/abs/1912.01734) 的约 25k 演示可作为后续跨域/视觉预训练来源，但其中 AI2-THOR 的低层动作和当前 TextWorld command 不完全同构，不能直接混入本实验的 warm start。若使用它，应先单独完成动作转换、回放和成功验证，并将其作为额外消融，而不是替代下面的主数据源。
+
+先构建一次不可覆盖的数据集；默认读取 `train` split 的所有可解游戏：
+
+```bash
+export ALFWORLD_ROOT=/datasets/alfworld/json_2.1.1
+bash scripts/build_alfworld_expert_sft.sh
+
+# 小规模数据管线验证（会创建一个新文件）
+SFT_DATA=data/alfworld/train-planner-sft-64.jsonl \
+SFT_LIMIT=64 \
+bash scripts/build_alfworld_expert_sft.sh
+```
+
+生成 `data/alfworld/train-planner-sft.jsonl` 与同名 `.report.json`；report 记录来源、重放通过数、排除原因、示例和数据 SHA256。已先生成 RL manifest 时，也可直接使用它：
+
+```bash
+python -m noise_rl.sft_data \
+  --manifest data/alfworld/train.jsonl \
+  --output data/alfworld/train-planner-sft-from-manifest.jsonl
+```
+
+SFT 只使用 Megatron actor 做离线 token-loss，不启动 SGLang、没有 rollout GPU，也不再执行环境 step。因此 8 卡时全部 8 张卡都用于训练（TP=2、DP=4）；SFT 专用 preflight 不要求 `sglang` 或 `flashinfer`，但仍要求 Slime/Megatron 的训练依赖。先 dry-run：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+bash scripts/train_alfworld_sft.sh \
+  --data data/alfworld/train-planner-sft.jsonl \
+  --hf-checkpoint /models/Qwen3-4B-Instruct-2507 \
+  --megatron-checkpoint /models/Qwen3-4B-Instruct-2507_torch_dist \
+  --output runs/alfworld-planner-sft-s42 \
+  --gpus 8 --tensor-parallel 2 --batch-size 32 --epochs 3 \
+  --lr 5e-6 --min-lr 5e-7 --max-tokens-per-gpu 8192 \
+  --dry-run
+```
+
+移除 `--dry-run` 后开始训练。可与现有实验一样追加 `--use-swanlab --swanlab-project agentic-noise-rl --swanlab-experiment-name alfworld-planner-sft-s42`。输出目录会保存 `run.json`（含 SFT 数据 SHA256、实际 Slime HEAD、完整命令）、Ray diagnostics、SwanLab 本地审计和 `checkpoints/`；`--resume` 仅接受相同数据、Slime 版本和训练超参。
+
+后续 RL 保持 `--hf-checkpoint` 为原始本地 Qwen 目录（用于 tokenizer/SGLang server），但把 `--megatron-checkpoint` 改为 SFT 产物。Slime 会从该 actor 权重开始，并在 rollout 前同步到 SGLang：
+
+```bash
+bash scripts/train_fully_async.sh \
+  --config configs/matched_loo_fully_async.yaml \
+  --data data/alfworld/train.jsonl \
+  --hf-checkpoint /models/Qwen3-4B-Instruct-2507 \
+  --megatron-checkpoint runs/alfworld-planner-sft-s42/checkpoints \
+  --output runs/matched-async-sft-init-s42 \
+  --seed 42 --gpus 8 --actor-gpus 4 --rollout-gpus 4 \
+  --tensor-parallel 2 --engine-gpus 2 --batch-size 8 --num-rollout 600
+```
+
+SFT 是奖励稀疏的解决起点，而不是论文结论：应至少比较 “RL from base” 与 “同一 SFT warm start 下的各 RL 方法”。若只让候选方法使用 SFT，会把初始化收益误判成算法收益。
+
 ## 5. 训练：先检查，再短跑，再主实验
 
 可选 AWM MCP 工具环境使用独立配置 `configs/matched_loo_awm.yaml`；见 [AWM 部署、数据与训练说明](docs/AWM.md)。原有 ALFWorld 配置保持独立。

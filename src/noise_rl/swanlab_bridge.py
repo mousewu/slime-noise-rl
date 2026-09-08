@@ -14,6 +14,8 @@ import math
 import os
 from numbers import Real
 from pathlib import Path
+from statistics import mean
+from threading import Lock
 from time import time
 from typing import Any
 
@@ -25,6 +27,60 @@ _FORWARD_WARNING_EMITTED = False
 _LOG_FORWARD_WARNING_EMITTED = False
 _LOG_HANDLER_NAME = "noise_rl_swanlab_log_mirror"
 _LOG_LEVELS = {"DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARNING": logging.WARNING, "ERROR": logging.ERROR}
+_ROLLOUT_TIMING_FIELDS = (
+    "environment_runner_wait_seconds",
+    "environment_queue_seconds",
+    "environment_step_seconds",
+    "model_request_seconds",
+    "elapsed_seconds",
+)
+
+
+class _RolloutTimingBuffer:
+    """Bound high-frequency rollout traces before sending scalar charts to SwanLab.
+
+    Fully-async Slime does not guarantee that its reward post-processing callback
+    is invoked in the same process that completes a trajectory.  Sending a
+    metric for every completed sample would make observability part of the
+    rollout critical path.  A process-local window instead creates one compact,
+    nonblocking chart event per comparison-group-sized set of completed traces.
+    Windows may straddle groups in fully-async mode; they are observability
+    summaries only and never participate in rewards or optimization.
+    """
+
+    def __init__(self):
+        self._lock = Lock()
+        self._records: list[tuple[int, dict[str, float]]] = []
+
+    def add(self, record: dict[str, Any], *, group_id: int, window_size: int) -> dict[str, float] | None:
+        if type(group_id) is not int or group_id < 0:
+            raise ValueError("Rollout timing group_id must be a nonnegative integer")
+        if type(window_size) is not int or window_size < 1:
+            raise ValueError("Rollout timing window_size must be a positive integer")
+        values = {}
+        for field in _ROLLOUT_TIMING_FIELDS:
+            scalar = _scalar(record.get(field, 0.0))
+            if scalar is None:
+                raise ValueError(f"Rollout timing field must be a finite scalar: {field}")
+            values[field] = float(scalar)
+        with self._lock:
+            self._records.append((group_id, values))
+            if len(self._records) < window_size:
+                return None
+            completed = self._records[:window_size]
+            del self._records[:window_size]
+        metrics: dict[str, float] = {
+            "rollout/stream/episodes": float(len(completed)),
+            "rollout/stream/group_id/max": float(max(group_id for group_id, _ in completed)),
+        }
+        for field in _ROLLOUT_TIMING_FIELDS:
+            field_values = [values[field] for _, values in completed]
+            metrics[f"rollout/stream/{field}/mean"] = mean(field_values)
+            metrics[f"rollout/stream/{field}/max"] = max(field_values)
+        return metrics
+
+
+_ROLLOUT_TIMING_BUFFER = _RolloutTimingBuffer()
 
 
 def _scalar(value: Any) -> int | float | None:
@@ -173,6 +229,35 @@ def _forward(metrics: dict[str, Any]) -> bool:
 def report_metrics(metrics: dict[str, Any]) -> bool:
     """Forward project-owned scalar metrics when SwanLab tracking is enabled."""
     return _forward(metrics)
+
+
+def report_metrics_nonblocking(metrics: dict[str, Any]) -> bool:
+    """Queue scalar metrics without making a rollout wait for the logger actor."""
+    global _FORWARD_WARNING_EMITTED
+    values = scalar_metrics(metrics)
+    if not values or not os.environ.get(SWANLAB_ACTOR_ENV):
+        return False
+    try:
+        _logger_actor().log.remote(values)
+        return True
+    except Exception:
+        if not _FORWARD_WARNING_EMITTED:
+            logging.getLogger(__name__).exception(
+                "SwanLab asynchronous metric forwarding failed; training will continue without further warning"
+            )
+            _FORWARD_WARNING_EMITTED = True
+        return False
+
+
+def report_rollout_timing(record: dict[str, Any], *, group_id: int, group_size: int) -> bool:
+    """Publish bounded per-trajectory timing summaries, including runner lease wait.
+
+    This path runs immediately after an episode completes, so it works for both
+    synchronous and fully-async Slime rollout paths even when their reward
+    post-processing is delayed or bypassed.
+    """
+    metrics = _ROLLOUT_TIMING_BUFFER.add(record, group_id=group_id, window_size=group_size)
+    return metrics is not None and report_metrics_nonblocking(metrics)
 
 
 def _redact_log_text(value: str) -> str:

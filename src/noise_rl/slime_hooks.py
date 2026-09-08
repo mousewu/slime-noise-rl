@@ -10,7 +10,7 @@ from .config import NoiseConfig, config_from_args
 from .data import atomic_json, read_records
 from .metrics import episode_record, summarize, trace_metrics
 from .sampling import SamplingPlan, plan_sample
-from .swanlab_bridge import report_metrics
+from .swanlab_bridge import report_metrics, report_rollout_timing
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +116,11 @@ async def generate(args, sample, sampling_params, evaluation=False):
     fill_sample(args, sample, trajectory)
     record = episode_record(trajectory, plan, config, checkpoint=metadata.get("evaluation_checkpoint"))
     sample.metadata["noise_result"] = record
+    if not evaluation:
+        # Fully-async Slime can decouple completed trajectories from the later
+        # reward-postprocess callback.  Emit a bounded, nonblocking timing
+        # summary here so ALFWorld runner lease waits always reach SwanLab.
+        report_rollout_timing(record, group_id=plan.group_id, group_size=config.group_size)
     if config.trace_dir:
         domain = f"eval_{metadata.get('evaluation_checkpoint', 0)}" if evaluation else "train"
         dataset = str(metadata.get("evaluation_dataset", "train"))

@@ -333,6 +333,8 @@ bash scripts/train.sh \
 
 接入层不修改 Slime 源码：Ray 的 worker setup hook 在每个训练进程中保留 Slime 原日志调用，并把标量指标转发给单一 SwanLab logger actor。SwanLab SDK 自动维护全局事件 step（包括断点恢复），桥接层同时保留 `train/step`、`rollout/step`、`eval/step` 等 Slime 原生计数器。每个完整 rollout 还会从逐轨迹 trace 汇总并记录 `rollout/success_rate`、token、工具调用、轨迹耗时、模型请求耗时、环境 step/排队耗时、worker 内 in-flight 轨迹数、终止原因和实际噪声触发率；评估会产生对应的 `eval/<dataset>/*` 指标。`--resume` 会复用 `run.json` 中保存的 SwanLab run ID；恢复时保持 SwanLab 项目、实验名和日志目录不变。
 
+fully-async 还会在每累积一个比较组大小的已完成轨迹后，非阻塞写入 `rollout/stream/*` 曲线，不依赖 Slime 何时执行 reward post-process。排查 ALFWorld 并行度时查看 `rollout/stream/environment_runner_wait_seconds/mean` 与 `/max`；同时可对照 `environment_queue_seconds`、`environment_step_seconds`、`model_request_seconds` 和 `elapsed_seconds`。这些是当前 Ray worker 的连续窗口均值，不影响 reward、group membership 或训练数据。
+
 启用 SwanLab 后，项目还会将每个 Ray worker 的 Python `INFO`、`WARNING`、`ERROR` 日志非阻塞镜像到 SwanLab 的 Logs 页；原始 Ray 日志仍保留在 Ray session 目录。本地 `swanlab/forwarded_logs.jsonl` 是镜像日志的完整审计副本，`metric_events.jsonl` 则保存标量指标。为减少噪声或上传量，可在启动前设置 `NOISE_RL_SWANLAB_LOG_LEVEL=WARNING`（默认 `INFO`）。`SWANLAB_API_KEY`、`HF_TOKEN` 和 `HUGGING_FACE_HUB_TOKEN` 出现在日志文本时会被脱敏。
 
 无论是否启用 SwanLab，启动入口都会在本地 Ray session 可见时，持续将 `ERROR`、Traceback、CUDA/OOM、SGLang abort 和 worker/driver 崩溃等日志附上下文转发到训练主日志；相同内容还会写入运行目录的 `ray_diagnostics.log`，因此后续调试不依赖 `/tmp/ray`。镜像器会跳过自身和 SwanLab 回写的内容，并对短时间内的相同异常去重，避免日志回环。默认每秒轮询一次；可用 `NOISE_RL_RAY_LOG_MIRROR=0` 关闭，或用 `NOISE_RL_RAY_LOG_POLL_SECONDS=2` 调整频率。连接远程 Ray cluster 时日志仍由 head 节点管理，镜像器会在主日志中明确提示本地 session 不可见。

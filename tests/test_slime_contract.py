@@ -125,6 +125,46 @@ def test_data_source_wraps_many_epochs_and_resumes(Sample, slime_args, tmp_path)
     assert [[s.metadata for s in g] for g in actual] == [[s.metadata for s in g] for g in expected]
 
 
+def test_data_source_requeues_only_full_aborted_groups(Sample, slime_args, tmp_path):
+    path = tmp_path / "train.jsonl"
+    write_records(path, mini_records(2, "train"))
+    slime_args.prompt_data = str(path)
+    source = NoiseDataSource(slime_args)
+    group = source.get_samples(1)[0]
+    original_plans = [copy.deepcopy(sample.metadata["noise_plan"]) for sample in group]
+
+    # Simulate an async weight-update interruption after other members had
+    # already finished.  A retry must regenerate the *whole* matched group.
+    for sample in group:
+        sample.status = Sample.Status.COMPLETED
+        sample.tokens = [1, 2, 3]
+        sample.response = "old trajectory"
+        sample.response_length = 2
+        sample.reward = 1.0
+        sample.loss_mask = [1, 1]
+        sample.rollout_log_probs = [0.0, 0.0]
+        sample.weight_versions = ["old-policy"]
+        sample.metadata["noise_result"] = {"success": True}
+    group[3].status = Sample.Status.ABORTED
+
+    source.add_samples([group])
+    with pytest.raises(ValueError, match="already queued"):
+        source.add_samples([group])
+
+    retried, fresh = source.get_samples(2)
+    assert retried is group
+    assert source.counter == 2  # The retry did not consume a new task id.
+    assert [sample.metadata["noise_plan"] for sample in retried] == original_plans
+    assert all(sample.status == Sample.Status.PENDING for sample in retried)
+    assert all(sample.response == "" and sample.response_length == 0 for sample in retried)
+    assert all(sample.reward is None and sample.tokens == [] for sample in retried)
+    assert all("noise_result" not in sample.metadata for sample in retried)
+    assert fresh[0].group_index == 1
+
+    with pytest.raises(ValueError, match="Partial/oversampled"):
+        source.add_samples([retried[:-1]])
+
+
 def test_resume_config_change_rejected(Sample, slime_args, tmp_path):
     path = tmp_path / "train.jsonl"
     write_records(path, mini_records(2, "train"))

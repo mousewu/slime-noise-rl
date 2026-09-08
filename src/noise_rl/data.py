@@ -4,10 +4,11 @@ import json
 import os
 import random
 import tempfile
+from collections import deque
 from pathlib import Path
 
 from .config import config_from_args
-from .sampling import plan_sample, stable_seed
+from .sampling import SamplingPlan, plan_sample, stable_seed
 
 
 def atomic_json(path: str | Path, value):
@@ -145,7 +146,14 @@ def alfworld_records(root: str | Path, split: str, limit: int | None = None) -> 
 
 
 class NoiseDataSource:
-    """Slime DataSource protocol with exact groups and checkpointed task/seed counters."""
+    """Slime data source with exact groups and a FIFO retry queue.
+
+    A fully-async Slime worker sends an entire group back through
+    :meth:`add_samples` when one of its members is interrupted for a weight
+    update.  Retrying only the interrupted member would break the matched
+    comparison and LOO baseline, so this source accepts *only* an untouched
+    complete group and returns it before allocating any new task.
+    """
 
     def __init__(self, args):
         self.args = args
@@ -160,6 +168,8 @@ class NoiseDataSource:
         self.metadata = {}
         self._epoch = None
         self._order = []
+        self._retry_buffer = deque()
+        self._queued_group_ids = set()
 
     def __len__(self):
         return len(self.records)
@@ -169,8 +179,8 @@ class NoiseDataSource:
 
         if type(num_samples) is not int or num_samples < 0:
             raise ValueError("num_samples must be a nonnegative integer")
-        output = []
-        for _ in range(num_samples):
+        output = self._take_retry_groups(num_samples, Sample)
+        for _ in range(num_samples - len(output)):
             epoch, offset = divmod(self.counter, len(self.records))
             if epoch != self._epoch:
                 self._order = list(range(len(self.records)))
@@ -198,8 +208,117 @@ class NoiseDataSource:
         return output
 
     def add_samples(self, samples):
-        if samples:
-            raise RuntimeError("Partial/oversampled trajectory buffering is not supported in this experiment")
+        """Queue a full aborted group for a clean, same-identity retry.
+
+        Slime's fully-async rollout worker calls this after it observes an
+        ``ABORTED`` member.  We deliberately do not support partial-rollout
+        buffering or arbitrary oversampling: either case would change the
+        members of a matched comparison group.
+        """
+        from slime.utils.types import Sample
+
+        if not samples:
+            return
+        if type(samples) is not list:
+            raise TypeError("NoiseDataSource.add_samples expects a list of complete groups")
+
+        group_ids = []
+        # Validate the complete input before mutating the FIFO, so an invalid
+        # second group cannot leave the first one partially accepted.
+        for group in samples:
+            group_ids.append(self._validate_retry_group(group, Sample))
+        if len(group_ids) != len(set(group_ids)):
+            raise ValueError("Cannot queue the same comparison group more than once")
+        duplicate_ids = set(group_ids) & self._queued_group_ids
+        if duplicate_ids:
+            raise ValueError(f"Comparison group(s) already queued for retry: {sorted(duplicate_ids)}")
+
+        self._retry_buffer.extend(samples)
+        self._queued_group_ids.update(group_ids)
+
+    def _take_retry_groups(self, num_samples, Sample):
+        output = []
+        while self._retry_buffer and len(output) < num_samples:
+            group = self._retry_buffer.popleft()
+            group_id = group[0].group_index
+            self._queued_group_ids.remove(group_id)
+            self._reset_group_for_clean_retry(group, Sample)
+            output.append(group)
+        return output
+
+    def _validate_retry_group(self, group, Sample):
+        if type(group) is not list:
+            raise TypeError("NoiseDataSource only buffers complete list[Sample] groups")
+        if len(group) != self.config.group_size:
+            raise ValueError(
+                "Partial/oversampled trajectory buffering is not supported: "
+                f"expected {self.config.group_size} samples, got {len(group)}"
+            )
+        if not all(isinstance(sample, Sample) for sample in group):
+            raise TypeError("NoiseDataSource only buffers Slime Sample instances")
+
+        group_id = group[0].group_index
+        if type(group_id) is not int or group_id < 0:
+            raise ValueError("Buffered comparison group requires a nonnegative integer group_index")
+        task_id = None
+        for rank, sample in enumerate(group):
+            if sample.group_index != group_id:
+                raise ValueError("Buffered samples must all belong to one comparison group")
+            expected_index = group_id * self.config.group_size + rank
+            if sample.index != expected_index or sample.rollout_id != expected_index:
+                raise ValueError("Buffered samples must retain their original ordered index and rollout_id")
+            if sample.remove_sample:
+                raise ValueError("Cannot retry a comparison group with removed members")
+            metadata = sample.metadata
+            if not isinstance(metadata, dict) or not isinstance(metadata.get("task"), dict):
+                raise ValueError("Buffered samples require task and noise-plan metadata")
+            current_task_id = metadata["task"].get("id")
+            raw_plan = metadata.get("noise_plan")
+            if not isinstance(current_task_id, str) or not current_task_id or not isinstance(raw_plan, dict):
+                raise ValueError("Buffered samples require a task id and serialized noise plan")
+            try:
+                plan = SamplingPlan(**raw_plan)
+            except TypeError as exc:
+                raise ValueError("Buffered samples have an invalid noise plan") from exc
+            if task_id is None:
+                task_id = current_task_id
+            if current_task_id != task_id or plan.task_id != task_id:
+                raise ValueError("Buffered comparison groups must use one task id")
+            expected_plan = plan_sample(self.config, task_id, group_id, rank)
+            if plan != expected_plan:
+                raise ValueError("Buffered samples must retain the original training noise plan")
+
+        if not any(sample.status == Sample.Status.ABORTED for sample in group):
+            raise ValueError("Only a full group containing an ABORTED member may be retried")
+        return group_id
+
+    @staticmethod
+    def _reset_group_for_clean_retry(group, Sample):
+        """Clear old rollout artifacts so every member is regenerated together.
+
+        ``generate_and_rm`` normally skips COMPLETED/TRUNCATED samples.  A
+        group interrupted halfway through therefore must not be handed back as
+        is: otherwise it would combine trajectories from two policy versions.
+        """
+        for sample in group:
+            sample.tokens = []
+            sample.response = ""
+            sample.response_length = 0
+            sample.reward = None
+            sample.loss_mask = []
+            sample.rollout_log_probs = []
+            sample.rollout_top_p_token_ids = None
+            sample.rollout_top_p_token_offsets = None
+            sample.rollout_routed_experts = None
+            sample.weight_versions = []
+            sample.teacher_log_probs = None
+            sample.non_generation_time = 0.0
+            if hasattr(sample, "spec_info"):
+                sample.spec_info = type(sample.spec_info)()
+            if hasattr(sample, "prefix_cache_info"):
+                sample.prefix_cache_info = type(sample.prefix_cache_info)()
+            sample.metadata.pop("noise_result", None)
+            sample.status = Sample.Status.PENDING
 
     def save(self, rollout_id):
         if not self.args.save:

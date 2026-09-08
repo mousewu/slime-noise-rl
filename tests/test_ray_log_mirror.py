@@ -7,9 +7,11 @@ class Records(logging.Handler):
     def __init__(self):
         super().__init__()
         self.messages = []
+        self.levels = []
 
     def emit(self, record):
         self.messages.append(record.getMessage())
+        self.levels.append(record.levelname)
 
 
 def test_find_ray_log_directory_uses_current_session(tmp_path):
@@ -40,7 +42,30 @@ def test_mirror_emits_error_with_context_and_writes_durable_audit(tmp_path, monk
     worker_log.write_text(worker_log.read_text() + "Bearer private-key\nnext frame\n")
     mirror.poll_once()
 
-    assert any("request=42\nCUDA error" in message for message in records.messages)
+    assert any("request=42" in message for message in records.messages)
+    assert any("CUDA error" in message for message in records.messages)
     assert any("Ray diagnostic context" in message for message in records.messages)
+    assert "INFO" in records.levels and "ERROR" in records.levels
     assert "private-key" not in audit.read_text()
     assert "<SWANLAB_API_KEY_REDACTED>" in audit.read_text()
+
+
+def test_mirror_ignores_its_own_swanlab_actor_output(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    worker_log = logs / "worker-swanlab.out"
+    worker_log.write_text(
+        "[noise-rl][ERROR][noise_rl.ray_log_mirror] "
+        "[Ray diagnostic][raylet.out] RuntimeError: already mirrored\n"
+    )
+
+    logger = logging.getLogger("test.ray_log_mirror_feedback")
+    logger.handlers.clear()
+    logger.propagate = False
+    records = Records()
+    logger.addHandler(records)
+    mirror = RayLogMirror(logs, logger=logger)
+
+    mirror.poll_once()
+
+    assert records.messages == []

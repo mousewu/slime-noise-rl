@@ -217,6 +217,20 @@ class Generation:
     request_id: str | None = None
 
 
+class SGLangAbort(RuntimeError):
+    """A weight-sync interruption that must be retried as a complete group.
+
+    This is deliberately distinct from transport and server failures.  Slime's
+    fully-async worker recognizes ``Sample.Status.ABORTED`` and puts the whole
+    comparison group back in its data buffer.  The custom generation hook
+    converts this exception into that status; it must never become reward zero.
+    """
+
+    def __init__(self, diagnostics: dict):
+        super().__init__("SGLang inference aborted; requeue the full comparison group")
+        self.diagnostics = diagnostics
+
+
 @dataclass
 class Segment:
     tokens: list[int]
@@ -336,6 +350,31 @@ class SGLangClient:
         response.raise_for_status()
         data = response.json()
         meta = data["meta_info"]
+        finish = meta.get("finish_reason", {})
+        reason = finish.get("type") if isinstance(finish, dict) else finish
+        request_id = (
+            data.get("id")
+            or meta.get("request_id")
+            or meta.get("id")
+            or meta.get("rid")
+            or response.headers.get("x-request-id")
+        )
+
+        # SGLang can abort before it has generated any token/logprob when the
+        # actor publishes a new weight version.  Return this separately from a
+        # malformed successful response so run_episode can preserve the
+        # diagnostics and the fully-async hook can requeue the *whole* group.
+        # Partial tokens are never resumed or trained after a policy change.
+        if reason == "abort":
+            return Generation(
+                [],
+                [],
+                data.get("text", ""),
+                reason,
+                meta,
+                str(request_id) if request_id is not None else None,
+            )
+
         pairs = meta.get("output_token_logprobs")
         if not pairs:
             raise RuntimeError(
@@ -349,15 +388,6 @@ class SGLangClient:
             for p in probs
         ):
             raise ValueError("Invalid rollout log probabilities")
-        finish = meta.get("finish_reason", {})
-        reason = finish.get("type") if isinstance(finish, dict) else finish
-        request_id = (
-            data.get("id")
-            or meta.get("request_id")
-            or meta.get("id")
-            or meta.get("rid")
-            or response.headers.get("x-request-id")
-        )
         return Generation(
             ids,
             probs,
@@ -447,25 +477,10 @@ async def run_episode(
                 request_elapsed_seconds = time.monotonic() - model_started
                 trajectory.model_requests += 1
                 trajectory.model_request_seconds += request_elapsed_seconds
-                if not generated.tokens or len(generated.tokens) != len(
-                    generated.log_probs
-                ):
-                    raise ValueError("Unaligned/empty generation")
-                if len(generated.tokens) > remaining:
-                    raise ValueError(
-                        "Inference server exceeded the requested token budget"
-                    )
-                trajectory.inference_input_tokens += len(token_ids)
-                trajectory.segments.append(
-                    Segment(
-                        generated.tokens,
-                        generated.log_probs,
-                        generated.text,
-                        True,
-                        generated.meta_info,
-                    )
-                )
                 if generated.finish_reason == "abort":
+                    # Do this before validating or appending generation tokens:
+                    # a response may have zero or partial tokens after a weight
+                    # update, neither of which belongs in an on-policy trace.
                     abort_diagnostics = {
                         "event": "sglang_inference_abort",
                         "task_id": plan.task_id,
@@ -492,13 +507,29 @@ async def run_episode(
                         },
                         "weight_update": weight_update_snapshot(),
                     }
-                    logger.error(
-                        "SGLang abort diagnostics: %s",
+                    logger.warning(
+                        "SGLang abort diagnostics (full group will be requeued): %s",
                         json.dumps(abort_diagnostics, ensure_ascii=False, sort_keys=True, default=str),
                     )
-                    raise RuntimeError(
-                        "Inference was aborted; do not turn infrastructure failures into zero reward"
+                    raise SGLangAbort(abort_diagnostics)
+                if not generated.tokens or len(generated.tokens) != len(
+                    generated.log_probs
+                ):
+                    raise ValueError("Unaligned/empty generation")
+                if len(generated.tokens) > remaining:
+                    raise ValueError(
+                        "Inference server exceeded the requested token budget"
                     )
+                trajectory.inference_input_tokens += len(token_ids)
+                trajectory.segments.append(
+                    Segment(
+                        generated.tokens,
+                        generated.log_probs,
+                        generated.text,
+                        True,
+                        generated.meta_info,
+                    )
+                )
                 if generated.finish_reason == "length":
                     trajectory.termination = "generation_length"
                     break  # Never execute a truncated tool call.

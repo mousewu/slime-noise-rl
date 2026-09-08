@@ -2,12 +2,15 @@
 
 import asyncio
 import os
+import sys
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from noise_rl.agent import QwenChatProtocol, run_episode
+from noise_rl import slime_hooks
+from noise_rl.agent import QwenChatProtocol, SGLangAbort, run_episode
 from noise_rl.config import ExperimentConfig, NoiseConfig
 from noise_rl.data import NoiseDataSource, mini_records, write_records
 from noise_rl.fixtures import ByteTokenizer, ScriptedClient
@@ -33,6 +36,65 @@ def test_actual_slime_sample_token_alignment(Sample, task, slime_args):
     assert sample.status == Sample.Status.COMPLETED and sample.reward == 1
     assert sample.response_length == len(sample.rollout_log_probs) == len(sample.loss_mask)
     assert all(p == 0 for p, m in zip(sample.rollout_log_probs, sample.loss_mask) if m == 0)
+
+
+def test_async_hook_marks_sglang_abort_for_full_group_requeue(task, slime_args, monkeypatch):
+    """The project hook must use Slime's ABORTED contract, not raise or reward zero."""
+
+    class Sample:
+        class Status:
+            ABORTED = "aborted"
+
+        def __init__(self, metadata):
+            self.metadata = metadata
+            self.status = None
+
+    class Client:
+        def __init__(self, *_args):
+            pass
+
+        async def close(self):
+            pass
+
+    async def abort_episode(*_args, **_kwargs):
+        raise SGLangAbort(
+            {
+                "turn": 3,
+                "episode": {"in_flight_episodes_at_abort": 16},
+            }
+        )
+
+    slime = ModuleType("slime")
+    rollout = ModuleType("slime.rollout")
+    sglang_rollout = ModuleType("slime.rollout.sglang_rollout")
+    sglang_rollout.GenerateState = lambda _args: SimpleNamespace(tokenizer=ByteTokenizer())
+    slime.rollout, rollout.sglang_rollout = rollout, sglang_rollout
+    monkeypatch.setitem(sys.modules, "slime", slime)
+    monkeypatch.setitem(sys.modules, "slime.rollout", rollout)
+    monkeypatch.setitem(sys.modules, "slime.rollout.sglang_rollout", sglang_rollout)
+    monkeypatch.setattr(slime_hooks, "SGLangClient", Client)
+    monkeypatch.setattr(slime_hooks, "run_episode", abort_episode)
+    events = []
+    monkeypatch.setattr(slime_hooks, "report_metrics", lambda metrics: events.append(metrics))
+
+    args = SimpleNamespace(
+        **vars(slime_args), sglang_router_ip="127.0.0.1", sglang_router_port=30000
+    )
+    config = ExperimentConfig.from_dict(args.noise_rl)
+    plan = plan_sample(config, task["id"], 0, 0)
+    sample = Sample({"task": task, "noise_plan": plan.to_dict()})
+
+    result = asyncio.run(slime_hooks.generate(args, sample, {"max_new_tokens": 96}))
+    assert result is sample and sample.status == Sample.Status.ABORTED
+    assert not hasattr(sample, "reward")
+    assert events == [
+        {
+            "rollout/sglang_abort/count": 1,
+            "rollout/sglang_abort/group_id": 0,
+            "rollout/sglang_abort/turn": 3,
+            "rollout/sglang_abort/in_flight_episodes": 16,
+        }
+    ]
 
 
 def test_actual_sample_reward_hook(Sample, slime_args):

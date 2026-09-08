@@ -276,7 +276,9 @@ bash scripts/train.sh \
 
 无论是否启用 SwanLab，启动入口都会在本地 Ray session 可见时，持续将 `ERROR`、Traceback、CUDA/OOM、SGLang abort 和 worker/driver 崩溃等日志附上下文转发到训练主日志；相同内容还会写入运行目录的 `ray_diagnostics.log`，因此后续调试不依赖 `/tmp/ray`。镜像器会跳过自身和 SwanLab 回写的内容，并对短时间内的相同异常去重，避免日志回环。默认每秒轮询一次；可用 `NOISE_RL_RAY_LOG_MIRROR=0` 关闭，或用 `NOISE_RL_RAY_LOG_POLL_SECONDS=2` 调整频率。连接远程 Ray cluster 时日志仍由 head 节点管理，镜像器会在主日志中明确提示本地 session 不可见。
 
-当 SGLang 返回 `finish_reason=abort` 时，训练日志会额外输出一条 `SGLang abort diagnostics` JSON：包含任务/group/rank、顶层或元数据中的 request ID、**完整** SGLang `meta_info`、输入/输出 token 数、当时的本地 in-flight episode 数和当前进程从 Slime `update_weights` timer 观察到的更新窗口状态。该诊断仅用于记录，不会把中止轨迹改写为零奖励或改变训练算法；`weight_update` 的作用域明确为当前 Ray 进程，因此 `active=false` 不表示其他进程没有同步权重。
+当 SGLang 返回 `finish_reason=abort` 时，训练日志会额外输出一条 `SGLang abort diagnostics` JSON：包含任务/group/rank、顶层或元数据中的 request ID、**完整** SGLang `meta_info`、输入/输出 token 数、当时的本地 in-flight episode 数和当前进程从 Slime `update_weights` timer 观察到的更新窗口状态。项目会把该 sample 标记为 `Sample.Status.ABORTED`；Slime 的 fully-async worker 随后将含有它的**完整比较组**重新入队。项目不会把中止轨迹改写为零奖励、不会使用部分 token，也不会重试单个 group 成员；`weight_update` 的作用域明确为当前 Ray 进程，因此 `active=false` 不表示其他进程没有同步权重。每次回队也会记录 `rollout/sglang_abort/*` SwanLab 标量。
+
+训练 rollout 指标还会记录 `rollout/advantages/zero_group_fraction` 和 `rollout/advantages/second_moment`。前者接近 1 代表一个比较组内所有样本奖励相同，LOO/GRPO 没有学习信号；不要仅根据均值为 0 判断训练是否失效。
 
 运行目录包含：
 

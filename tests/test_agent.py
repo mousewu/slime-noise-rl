@@ -12,6 +12,7 @@ import pytest
 from noise_rl.agent import (
     Generation,
     QwenChatProtocol,
+    SGLangAbort,
     SGLangClient,
     close_environment,
     create_environment,
@@ -284,15 +285,19 @@ def test_aborted_inference_logs_complete_diagnostics(task, caplog, monkeypatch):
         "noise_rl.agent.weight_update_snapshot",
         lambda: {"scope": "current_process_timer_log", "observed": True, "active": True},
     )
-    caplog.set_level(logging.ERROR, logger="noise_rl.agent")
+    caplog.set_level(logging.WARNING, logger="noise_rl.agent")
 
-    with pytest.raises(RuntimeError, match="Inference was aborted"):
+    with pytest.raises(SGLangAbort, match="requeue the full comparison group"):
         run(task, client=AbortedClient())
 
     message = next(
-        record.message for record in caplog.records if record.message.startswith("SGLang abort diagnostics: ")
+        record.message
+        for record in caplog.records
+        if record.message.startswith("SGLang abort diagnostics (full group will be requeued): ")
     )
-    payload = json.loads(message.removeprefix("SGLang abort diagnostics: "))
+    payload = json.loads(
+        message.removeprefix("SGLang abort diagnostics (full group will be requeued): ")
+    )
     assert payload["request"]["request_id"] == "top-level-request"
     assert payload["request"]["meta_info"]["request_id"] == "meta-request"
     assert payload["episode"]["in_flight_episodes_at_abort"] == 1
@@ -334,3 +339,29 @@ def test_native_sglang_http_contract():
     assert result.tokens == [3, 151645] and result.log_probs == [-0.2, -0.4]
     assert result.request_id == "sglang-request-7"
     assert seen[0]["input_ids"] == [1, 2] and seen[0]["return_logprob"] is True
+
+
+def test_sglang_abort_without_logprobs_is_not_reported_as_malformed_response():
+    def handler(_request):
+        return httpx.Response(
+            200,
+            json={
+                "id": "aborted-request",
+                "text": "",
+                "meta_info": {"finish_reason": {"type": "abort"}},
+            },
+        )
+
+    async def execute():
+        client = SGLangClient("http://localhost:1")
+        await client.client.aclose()
+        client.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            return await client.generate([1, 2], {"temperature": 0.8})
+        finally:
+            await client.close()
+
+    result = asyncio.run(execute())
+    assert result.finish_reason == "abort"
+    assert result.tokens == result.log_probs == []
+    assert result.request_id == "aborted-request"

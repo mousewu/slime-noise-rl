@@ -5,7 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .advantages import group_advantages
-from .agent import SGLangClient, run_episode
+from .agent import SGLangAbort, SGLangClient, run_episode
 from .config import NoiseConfig, config_from_args
 from .data import atomic_json, read_records
 from .metrics import episode_record, summarize, trace_metrics
@@ -90,6 +90,27 @@ async def generate(args, sample, sampling_params, evaluation=False):
     client = SGLangClient(f"http://{host}:{args.sglang_router_port}", config.request_timeout, headers)
     try:
         trajectory = await run_episode(metadata["task"], plan, config, tokenizer, client, params)
+    except SGLangAbort as exc:
+        # Slime's fully-async worker detects any ABORTED member and requeues the
+        # original group.  Do not fill a partial trace, assign reward zero, or
+        # retry this individual member: each would corrupt a matched LOO group.
+        sample.status = sample.Status.ABORTED
+        report_metrics(
+            {
+                "rollout/sglang_abort/count": 1,
+                "rollout/sglang_abort/group_id": plan.group_id,
+                "rollout/sglang_abort/turn": exc.diagnostics["turn"],
+                "rollout/sglang_abort/in_flight_episodes": exc.diagnostics[
+                    "episode"
+                ]["in_flight_episodes_at_abort"],
+            }
+        )
+        logger.warning(
+            "Marked sample as ABORTED for Slime full-group requeue: group=%s rank=%s",
+            plan.group_id,
+            plan.rank,
+        )
+        return sample
     finally:
         await client.close()
     fill_sample(args, sample, trajectory)
@@ -125,6 +146,12 @@ def reward_postprocess(args, samples):
                 "rollout/reward/total": sum(rewards),
                 "rollout/advantages/mean": sum(normalized) / len(normalized),
                 "rollout/advantages/abs_mean": sum(abs(value) for value in normalized) / len(normalized),
+                "rollout/advantages/zero_group_fraction": statistics[
+                    "advantage_zero_group_fraction"
+                ],
+                "rollout/advantages/second_moment": statistics[
+                    "advantage_second_moment"
+                ],
                 "rollout/groups": len({plan.group_id for plan in plans}),
             }
         )

@@ -62,6 +62,14 @@ def main(entrypoint: str = "train.py"):
         raise FileNotFoundError(f"Slime {entrypoint} was not found in {slime}")
     sys.argv = [str(script), *sys.argv[2:]]
     sys.path.insert(0, str(slime))
+    fully_async = entrypoint == "train_async.py"
+    if fully_async:
+        # Propagate this explicit mode marker into all Ray workers.  It keeps
+        # the runtime-only Slime wrapper out of the normal synchronous path.
+        os.environ["NOISE_RL_FULLY_ASYNC_QUEUE_METRICS"] = "1"
+        from .async_queue_metrics import install_fully_async_queue_metrics
+
+        install_fully_async_queue_metrics()
     swanlab_settings = (
         json.loads(os.environ[SWANLAB_CONFIG_ENV]) if os.environ.get(SWANLAB_CONFIG_ENV) else None
     )
@@ -75,6 +83,7 @@ def main(entrypoint: str = "train.py"):
             # environment runners inherit this location from the Ray worker.
             "TMPDIR",
             "NOISE_RL_RAY_TMPDIR",
+            "NOISE_RL_FULLY_ASYNC_QUEUE_METRICS",
             "CUDA_DEVICE_MAX_CONNECTIONS",
             "NVTE_FUSED_ATTN",
             "NVTE_FLASH_ATTN",

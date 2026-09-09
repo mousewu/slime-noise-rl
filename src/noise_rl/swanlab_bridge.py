@@ -348,5 +348,9 @@ def setup_worker() -> None:
     from .rollout_diagnostics import install_slime_timer_patch
 
     install_slime_timer_patch()
+    if os.environ.get("NOISE_RL_FULLY_ASYNC_QUEUE_METRICS"):
+        from .async_queue_metrics import install_fully_async_queue_metrics
+
+        install_fully_async_queue_metrics()
     if os.environ.get(SWANLAB_CONFIG_ENV):
         install_slime_logging_patch()

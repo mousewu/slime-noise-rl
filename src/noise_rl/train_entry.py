@@ -92,6 +92,11 @@ def main(entrypoint: str = "train.py"):
             "CUBLAS_WORKSPACE_CONFIG",
             "SWANLAB_API_KEY",
             "SWANLAB_API_HOST",
+            # Project-local bounded telemetry controls.  These must reach the
+            # Ray workers that produce rollout and Slime log records.
+            "NOISE_RL_SWANLAB_LOG_LEVEL",
+            "NOISE_RL_SWANLAB_MAX_PENDING_LOGS",
+            "NOISE_RL_SWANLAB_MAX_PENDING_METRICS",
             SWANLAB_CONFIG_ENV,
             SWANLAB_ACTOR_ENV,
         )

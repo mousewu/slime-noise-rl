@@ -21,17 +21,23 @@ from time import monotonic
 
 
 _LOGGER = logging.getLogger(__name__)
-_ERROR_PATTERN = re.compile(
-    r"(?:\b(?:[a-z_]*error|[a-z_]*exception|fatal|abort(?:ed)?|sig(?:term|kill|segv|abrt))\b"
+_ACTIONABLE_PATTERN = re.compile(
+    r"(?:\b(?:fatal|critical|sig(?:term|kill|segv|abrt))\b"
     r"|out of memory|cuda (?:error|exception)|segmentation fault"
-    r"|(?:worker|driver).{0,80}\b(?:died|crashed|killed)\b)",
+    r"|(?:worker|driver).{0,80}\b(?:died|crashed|killed)\b"
+    r"|\b(?:[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception)|Traceback)\b)",
     re.IGNORECASE,
+)
+_BENIGN_PATTERN = re.compile(
+    r"(?:ignore import error|optional dependency|module not found.*optional)", re.IGNORECASE
 )
 _AUTHORIZATION_PATTERN = re.compile(r"(authorization\s*[:=]\s*bearer\s+)\S+", re.IGNORECASE)
 _MAX_INITIAL_BYTES = 64 * 1024
 _MAX_READ_BYTES = 2 * 1024 * 1024
 _DEDUP_SECONDS = 60.0
 _MAX_DEDUP_ENTRIES = 2048
+_DEFAULT_CONTEXT_LINES = 8
+_DEFAULT_FOLLOWUP_LINES = 8
 
 
 def find_ray_log_directory(ray_tmpdir: str | None) -> Path | None:
@@ -84,8 +90,8 @@ class RayLogMirror:
         *,
         audit_path: Path | None = None,
         poll_seconds: float = 1.0,
-        context_lines: int = 20,
-        followup_lines: int = 30,
+        context_lines: int = _DEFAULT_CONTEXT_LINES,
+        followup_lines: int = _DEFAULT_FOLLOWUP_LINES,
         logger: logging.Logger | None = None,
     ):
         if poll_seconds <= 0:
@@ -173,12 +179,23 @@ class RayLogMirror:
         if followups:
             self._emit(path, line, followup=True)
             self._followups[path] = followups - 1
-        if _ERROR_PATTERN.search(line) and not self._is_duplicate(path, line):
+        if self._is_actionable(line) and not self._is_duplicate(path, line):
             if context:
                 self._emit(path, "\n".join(context), context=True)
             self._emit(path, line)
             self._followups[path] = self.followup_lines
         context.append(line)
+
+    @staticmethod
+    def _is_actionable(line: str) -> bool:
+        """Ignore expected engine aborts and harmless optional-import noise.
+
+        The previous broad ``*error``/``abort`` match turned high-frequency
+        SGLang maintenance messages into context/follow-up floods.  Actual
+        Python exceptions, OOMs, native crashes, and dead Ray workers remain
+        mirrored with surrounding context.
+        """
+        return not _BENIGN_PATTERN.search(line) and bool(_ACTIONABLE_PATTERN.search(line))
 
     def _is_duplicate(self, path: Path, line: str) -> bool:
         now = monotonic()
@@ -234,10 +251,18 @@ def start_ray_log_mirror(
         )
         return None
     interval = float(os.environ.get("NOISE_RL_RAY_LOG_POLL_SECONDS", "1"))
+    context_lines = int(
+        os.environ.get("NOISE_RL_RAY_LOG_CONTEXT_LINES", str(_DEFAULT_CONTEXT_LINES))
+    )
+    followup_lines = int(
+        os.environ.get("NOISE_RL_RAY_LOG_FOLLOWUP_LINES", str(_DEFAULT_FOLLOWUP_LINES))
+    )
     mirror = RayLogMirror(
         log_dir,
         audit_path=Path(audit_path).expanduser() if audit_path else None,
         poll_seconds=interval,
+        context_lines=context_lines,
+        followup_lines=followup_lines,
     )
     mirror.start()
     return mirror

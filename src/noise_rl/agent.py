@@ -172,7 +172,9 @@ async def create_episode_environment(
         and task.get("environment") == "alfworld"
         and environment_factory is make_environment
     ):
-        return await get_process_environment_pool(config.environment_processes).open(task)
+        return await get_process_environment_pool(
+            config.environment_processes, config.environment_recycle_episodes
+        ).open(task)
     loop = asyncio.get_running_loop()
     environment = await loop.run_in_executor(
         environment_executor(config.environment_workers),
@@ -257,6 +259,8 @@ class Trajectory:
     environment_queue_seconds: float = 0.0
     environment_step_seconds: float = 0.0
     environment_runner_wait_seconds: float = 0.0
+    environment_runner_recycled: bool = False
+    environment_runner_restarts_total: int = 0
     in_flight_episodes_at_start: int = 0
 
     @property
@@ -414,6 +418,7 @@ async def run_episode(
     with EpisodeActivity() as in_flight_at_start:
         protocol = QwenChatProtocol(tokenizer)
         env = None
+        trajectory = None
         try:
             environment, runner_wait_seconds = await create_episode_environment(
                 task, config, environment_factory
@@ -507,7 +512,7 @@ async def run_episode(
                         },
                         "weight_update": weight_update_snapshot(),
                     }
-                    logger.warning(
+                    logger.info(
                         "SGLang abort diagnostics (full group will be requeued): %s",
                         json.dumps(abort_diagnostics, ensure_ascii=False, sort_keys=True, default=str),
                     )
@@ -604,3 +609,7 @@ async def run_episode(
         finally:
             if env is not None:
                 await close_episode_environment(env, config.environment_workers)
+                raw_environment = getattr(env, "env", env)
+                if trajectory is not None and isinstance(raw_environment, ProcessIsolatedALFWorldEnvironment):
+                    trajectory.environment_runner_recycled = raw_environment.recycled_on_release
+                    trajectory.environment_runner_restarts_total = raw_environment.runner_restarts_total

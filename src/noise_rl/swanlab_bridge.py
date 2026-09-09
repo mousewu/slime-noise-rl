@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+from collections import deque
 from numbers import Real
 from pathlib import Path
 from statistics import mean
@@ -81,6 +82,109 @@ class _RolloutTimingBuffer:
 
 
 _ROLLOUT_TIMING_BUFFER = _RolloutTimingBuffer()
+
+
+def _positive_environment_integer(name: str, default: int) -> int:
+    """Read a defensive queue limit without making a logging handler fail."""
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+class _BoundedRayForwarder:
+    """Keep one worker from growing a Ray actor mailbox without bound.
+
+    ``ActorHandle.method.remote`` only enqueues work; it does not apply
+    backpressure when the single SwanLab actor is slower than producers.  Keep
+    a small local set of unfinished ObjectRefs instead.  At capacity new
+    telemetry is intentionally dropped, never retained in Python/Ray queues
+    and never allowed to delay an environment or model request.
+    """
+
+    def __init__(self, *, limit_environment: str, default_limit: int):
+        self._limit_environment = limit_environment
+        self._default_limit = default_limit
+        self._lock = Lock()
+        self._pending = deque()
+        self._submitted_total = 0
+        self._dropped_total = 0
+        self._failed_total = 0
+
+    def submit(self, submit_remote) -> str:
+        """Return ``submitted``, ``dropped``, or ``failed`` without waiting."""
+        with self._lock:
+            self._reap_completed_locked()
+            limit = _positive_environment_integer(self._limit_environment, self._default_limit)
+            if len(self._pending) >= limit:
+                self._dropped_total += 1
+                return "dropped"
+            try:
+                reference = submit_remote()
+            except Exception:
+                self._failed_total += 1
+                return "failed"
+            # Test doubles and a few Ray-compatible wrappers may return None.
+            # There is then no asynchronous object to retain or reap.
+            if reference is not None:
+                self._pending.append(reference)
+            self._submitted_total += 1
+            return "submitted"
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            self._reap_completed_locked()
+            return {
+                "pending": len(self._pending),
+                "submitted_total": self._submitted_total,
+                "dropped_total": self._dropped_total,
+                "failed_total": self._failed_total,
+            }
+
+    def _reap_completed_locked(self) -> None:
+        if not self._pending:
+            return
+        try:
+            import ray
+
+            ready, _ = ray.wait(
+                list(self._pending), num_returns=len(self._pending), timeout=0
+            )
+        except Exception:
+            # A temporary Ray outage must not make the parent logging path
+            # block or turn its small bounded queue into a training failure.
+            return
+        if not ready:
+            return
+        ready_ids = {id(reference) for reference in ready}
+        self._pending = deque(
+            reference for reference in self._pending if id(reference) not in ready_ids
+        )
+
+
+_METRIC_FORWARDER = _BoundedRayForwarder(
+    limit_environment="NOISE_RL_SWANLAB_MAX_PENDING_METRICS", default_limit=64
+)
+_LOG_FORWARDER = _BoundedRayForwarder(
+    limit_environment="NOISE_RL_SWANLAB_MAX_PENDING_LOGS", default_limit=32
+)
+
+
+def _bridge_health_metrics() -> dict[str, int]:
+    """Expose local backpressure state in ordinary scalar SwanLab metrics."""
+    metric = _METRIC_FORWARDER.snapshot()
+    logs = _LOG_FORWARDER.snapshot()
+    return {
+        "swanlab/bridge/metrics/pending": metric["pending"],
+        "swanlab/bridge/metrics/submitted_total": metric["submitted_total"],
+        "swanlab/bridge/metrics/dropped_total": metric["dropped_total"],
+        "swanlab/bridge/metrics/failed_total": metric["failed_total"],
+        "swanlab/bridge/logs/pending": logs["pending"],
+        "swanlab/bridge/logs/submitted_total": logs["submitted_total"],
+        "swanlab/bridge/logs/dropped_total": logs["dropped_total"],
+        "swanlab/bridge/logs/failed_total": logs["failed_total"],
+    }
 
 
 def _scalar(value: Any) -> int | float | None:
@@ -208,6 +312,7 @@ def _logger_actor():
 def _forward(metrics: dict[str, Any]) -> bool:
     global _FORWARD_WARNING_EMITTED
     values = scalar_metrics(metrics)
+    values.update(_bridge_health_metrics())
     if not values:
         return False
     if not os.environ.get(SWANLAB_ACTOR_ENV):
@@ -237,9 +342,17 @@ def report_metrics_nonblocking(metrics: dict[str, Any]) -> bool:
     values = scalar_metrics(metrics)
     if not values or not os.environ.get(SWANLAB_ACTOR_ENV):
         return False
+    values.update(_bridge_health_metrics())
     try:
-        _logger_actor().log.remote(values)
-        return True
+        result = _METRIC_FORWARDER.submit(lambda: _logger_actor().log.remote(values))
+        if result == "submitted":
+            return True
+        if result == "failed" and not _FORWARD_WARNING_EMITTED:
+            logging.getLogger(__name__).warning(
+                "SwanLab asynchronous metric forwarding failed; training will continue"
+            )
+            _FORWARD_WARNING_EMITTED = True
+        return False
     except Exception:
         if not _FORWARD_WARNING_EMITTED:
             logging.getLogger(__name__).exception(
@@ -269,18 +382,20 @@ def _redact_log_text(value: str) -> str:
     return value
 
 
-def _forward_log(payload: dict[str, Any]) -> None:
+def _forward_log(payload: dict[str, Any]) -> bool:
     """Submit a worker log line without delaying model, environment, or Ray work."""
     global _LOG_FORWARD_WARNING_EMITTED
     if not os.environ.get(SWANLAB_ACTOR_ENV):
-        return
+        return False
     try:
-        _logger_actor().log_text.remote(payload)
+        result = _LOG_FORWARDER.submit(lambda: _logger_actor().log_text.remote(payload))
+        return result == "submitted"
     except Exception:
         # Do not use logging here: the caller is a logging handler and would
         # recursively invoke this path. The local Ray log remains authoritative.
         if not _LOG_FORWARD_WARNING_EMITTED:
             _LOG_FORWARD_WARNING_EMITTED = True
+        return False
 
 
 class _SwanLabLogMirror(logging.Handler):
@@ -304,12 +419,12 @@ class _SwanLabLogMirror(logging.Handler):
 
 
 def install_log_mirror() -> None:
-    """Attach one INFO+ handler after Slime has configured this process's root logger."""
+    """Attach one bounded WARNING+ handler after Slime configures a process."""
     root = logging.getLogger()
     if any(getattr(handler, "_noise_rl_name", None) == _LOG_HANDLER_NAME for handler in root.handlers):
         return
-    configured_level = os.environ.get("NOISE_RL_SWANLAB_LOG_LEVEL", "INFO").upper()
-    handler = _SwanLabLogMirror(level=_LOG_LEVELS.get(configured_level, logging.INFO))
+    configured_level = os.environ.get("NOISE_RL_SWANLAB_LOG_LEVEL", "WARNING").upper()
+    handler = _SwanLabLogMirror(level=_LOG_LEVELS.get(configured_level, logging.WARNING))
     handler._noise_rl_name = _LOG_HANDLER_NAME
     handler.setFormatter(logging.Formatter("%(message)s"))
     root.addHandler(handler)

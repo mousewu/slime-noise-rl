@@ -6,6 +6,7 @@ from types import ModuleType, SimpleNamespace
 from noise_rl import swanlab_bridge
 from noise_rl.swanlab_bridge import (
     SwanLabLogger,
+    _BoundedRayForwarder,
     _SwanLabLogMirror,
     _RolloutTimingBuffer,
     install_slime_logging_patch,
@@ -131,6 +132,23 @@ def test_worker_log_handler_submits_nonblocking_text(monkeypatch):
     assert forwarded[0]["message"] == "slow rollout 7"
 
 
+def test_bounded_forwarder_drops_new_logs_when_actor_is_not_draining(monkeypatch):
+    references = []
+    forwarder = _BoundedRayForwarder(limit_environment="TEST_MAX_PENDING", default_limit=2)
+    monkeypatch.setenv("TEST_MAX_PENDING", "2")
+
+    assert forwarder.submit(lambda: references.append(object()) or references[-1]) == "submitted"
+    assert forwarder.submit(lambda: references.append(object()) or references[-1]) == "submitted"
+    assert forwarder.submit(lambda: references.append(object()) or references[-1]) == "dropped"
+    assert len(references) == 2
+    assert forwarder.snapshot() == {
+        "pending": 2,
+        "submitted_total": 2,
+        "dropped_total": 1,
+        "failed_total": 0,
+    }
+
+
 def test_rollout_timing_buffer_emits_windowed_environment_metrics():
     buffer = _RolloutTimingBuffer()
     first = {
@@ -191,22 +209,23 @@ def test_rollout_timing_forwards_nonblocking_after_one_group(monkeypatch):
 
     assert not report_rollout_timing(record, group_id=8, group_size=2)
     assert report_rollout_timing(record, group_id=8, group_size=2)
-    assert forwarded == [
-        {
-            "rollout/stream/episodes": 2.0,
-            "rollout/stream/group_id/max": 8.0,
-            "rollout/stream/environment_runner_wait_seconds/mean": 0.25,
-            "rollout/stream/environment_runner_wait_seconds/max": 0.25,
-            "rollout/stream/environment_queue_seconds/mean": 0.5,
-            "rollout/stream/environment_queue_seconds/max": 0.5,
-            "rollout/stream/environment_step_seconds/mean": 1.0,
-            "rollout/stream/environment_step_seconds/max": 1.0,
-            "rollout/stream/model_request_seconds/mean": 2.0,
-            "rollout/stream/model_request_seconds/max": 2.0,
-            "rollout/stream/elapsed_seconds/mean": 3.0,
-            "rollout/stream/elapsed_seconds/max": 3.0,
-        }
-    ]
+    assert len(forwarded) == 1
+    assert {
+        key: value for key, value in forwarded[0].items() if not key.startswith("swanlab/bridge/")
+    } == {
+        "rollout/stream/episodes": 2.0,
+        "rollout/stream/group_id/max": 8.0,
+        "rollout/stream/environment_runner_wait_seconds/mean": 0.25,
+        "rollout/stream/environment_runner_wait_seconds/max": 0.25,
+        "rollout/stream/environment_queue_seconds/mean": 0.5,
+        "rollout/stream/environment_queue_seconds/max": 0.5,
+        "rollout/stream/environment_step_seconds/mean": 1.0,
+        "rollout/stream/environment_step_seconds/max": 1.0,
+        "rollout/stream/model_request_seconds/mean": 2.0,
+        "rollout/stream/model_request_seconds/max": 2.0,
+        "rollout/stream/elapsed_seconds/mean": 3.0,
+        "rollout/stream/elapsed_seconds/max": 3.0,
+    }
 
 
 def test_runtime_patch_preserves_slime_logger_and_forwards_once(monkeypatch):
@@ -242,4 +261,7 @@ def test_runtime_patch_preserves_slime_logger_and_forwards_once(monkeypatch):
     logging_utils.log(args, metrics, "train/step")
 
     assert original_calls == [(args, metrics, "train/step")]
-    assert forwarded == [{"train/step": 3, "train/loss": 0.125}]
+    assert {key: value for key, value in forwarded[0].items() if not key.startswith("swanlab/bridge/")} == {
+        "train/step": 3,
+        "train/loss": 0.125,
+    }

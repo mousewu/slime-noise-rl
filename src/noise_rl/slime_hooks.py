@@ -10,7 +10,7 @@ from .config import NoiseConfig, config_from_args
 from .data import atomic_json, read_records
 from .metrics import episode_record, summarize, trace_metrics
 from .sampling import SamplingPlan, plan_sample
-from .swanlab_bridge import report_metrics, report_rollout_timing
+from .swanlab_bridge import report_metrics, report_metrics_nonblocking, report_rollout_timing
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,9 @@ async def generate(args, sample, sampling_params, evaluation=False):
         # original group.  Do not fill a partial trace, assign reward zero, or
         # retry this individual member: each would corrupt a matched LOO group.
         sample.status = sample.Status.ABORTED
-        report_metrics(
+        # Weight-sync aborts are expected in fully-async mode. Keep their
+        # scalar counter, but never hold a requeued group behind SwanLab I/O.
+        report_metrics_nonblocking(
             {
                 "rollout/sglang_abort/count": 1,
                 "rollout/sglang_abort/group_id": plan.group_id,
@@ -105,7 +107,7 @@ async def generate(args, sample, sampling_params, evaluation=False):
                 ]["in_flight_episodes_at_abort"],
             }
         )
-        logger.warning(
+        logger.info(
             "Marked sample as ABORTED for Slime full-group requeue: group=%s rank=%s",
             plan.group_id,
             plan.rank,

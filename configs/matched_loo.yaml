@@ -14,6 +14,9 @@ noise_rl:
   # permits 32 trajectories to execute genuine environment steps in parallel
   # without sharing TextWorld's non-thread-safe parser.
   environment_processes: 32
+  # Replace each idle TextWorld child after 32 episodes so parser/native
+  # allocator high-water memory cannot accumulate for the entire run.
+  environment_recycle_episodes: 32
   noise:
     action_drop: 0.15
     observation_loss: 0.10

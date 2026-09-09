@@ -42,6 +42,10 @@ class ExperimentConfig:
     # Zero preserves the thread-based backend.  A positive value gives
     # ALFWorld trajectories process-isolated, stateful environment runners.
     environment_processes: int = 0
+    # A TextWorld child can retain native/parser allocator high-water memory
+    # even after an environment has been closed.  Recreate an idle child after
+    # this many completed leases.  Zero is an explicit opt-out for diagnosis.
+    environment_recycle_episodes: int = 32
     awm_url: str | None = None
     retry_limit: int = 0
     trace_dir: str | None = None
@@ -69,6 +73,11 @@ class ExperimentConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if type(self.environment_processes) is not int or self.environment_processes < 0:
             raise ValueError("environment_processes must be a nonnegative integer")
+        if (
+            type(self.environment_recycle_episodes) is not int
+            or self.environment_recycle_episodes < 0
+        ):
+            raise ValueError("environment_recycle_episodes must be a nonnegative integer")
         if self.group_size < 2 or self.group_size % self.scenarios:
             raise ValueError("group_size must be >=2 and divisible by scenarios")
         if self.method == "matched" and self.group_size // self.scenarios < 2:

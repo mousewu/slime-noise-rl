@@ -1,7 +1,7 @@
 """Runtime-only metrics for Slime's fully-async rollout queue.
 
-Slime deliberately keeps its completed-group queue private and unbounded.  We
-leave its source untouched, but replace its worker class *at runtime* before
+Slime keeps its completed-group queue private behind its own concurrency and
+top-up policy. We leave its source untouched, but replace its worker class *at runtime* before
 the rollout function is resolved.  The replacement preserves the upstream
 implementation and only observes task launch/completion and queue draining.
 """

@@ -117,6 +117,7 @@ def test_invalid_probability(value):
         {"method": "typo"},
         {"retry_limit": -1},
         {"environment_processes": -1},
+        {"environment_recycle_episodes": -1},
     ],
 )
 def test_invalid_config(kwargs):

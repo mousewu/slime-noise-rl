@@ -75,7 +75,9 @@ def test_async_hook_marks_sglang_abort_for_full_group_requeue(task, slime_args, 
     monkeypatch.setattr(slime_hooks, "SGLangClient", Client)
     monkeypatch.setattr(slime_hooks, "run_episode", abort_episode)
     events = []
-    monkeypatch.setattr(slime_hooks, "report_metrics", lambda metrics: events.append(metrics))
+    monkeypatch.setattr(
+        slime_hooks, "report_metrics_nonblocking", lambda metrics: events.append(metrics)
+    )
 
     args = SimpleNamespace(
         **vars(slime_args), sglang_router_ip="127.0.0.1", sglang_router_port=30000

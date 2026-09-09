@@ -13,6 +13,9 @@ noise_rl:
   # Per RolloutManager: one leased TextWorld process per live ALFWorld
   # trajectory, so up to 32 real environment steps can proceed in parallel.
   environment_processes: 32
+  # Process-isolated TextWorld runners are periodically recreated only after
+  # close/release; this bounds their native high-water memory.
+  environment_recycle_episodes: 32
   noise:
     action_drop: 0.15
     observation_loss: 0.10

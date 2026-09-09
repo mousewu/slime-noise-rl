@@ -16,7 +16,7 @@ def episode_record(
     checkpoint=None,
 ):
     return {
-        "schema": 3,
+        "schema": 4,
         "plan": plan.to_dict(),
         "config": config.to_dict(),
         "checkpoint": checkpoint,
@@ -32,6 +32,8 @@ def episode_record(
         "environment_queue_seconds": trajectory.environment_queue_seconds,
         "environment_step_seconds": trajectory.environment_step_seconds,
         "environment_runner_wait_seconds": trajectory.environment_runner_wait_seconds,
+        "environment_runner_recycled": trajectory.environment_runner_recycled,
+        "environment_runner_restarts_total": trajectory.environment_runner_restarts_total,
         "in_flight_episodes_at_start": trajectory.in_flight_episodes_at_start,
         "turns": len([s for s in trajectory.segments if s.trainable]),
         "format_errors": sum(step["format_error"] for step in trajectory.steps),
@@ -155,6 +157,12 @@ def trace_metrics(
         ),
         f"{prefix}/environment_runner_wait_seconds/total": sum(
             record.get("environment_runner_wait_seconds", 0.0) for record in records
+        ),
+        f"{prefix}/environment_runner/recycled/total": sum(
+            bool(record.get("environment_runner_recycled", False)) for record in records
+        ),
+        f"{prefix}/environment_runner/restarts/total": max(
+            (record.get("environment_runner_restarts_total", 0) for record in records), default=0
         ),
         f"{prefix}/in_flight_episodes_at_start/mean": mean(
             record.get("in_flight_episodes_at_start", 1) for record in records

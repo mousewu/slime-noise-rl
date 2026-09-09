@@ -69,3 +69,24 @@ def test_mirror_ignores_its_own_swanlab_actor_output(tmp_path):
     mirror.poll_once()
 
     assert records.messages == []
+
+
+def test_mirror_ignores_expected_abort_and_optional_import_noise(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    worker_log = logs / "worker-engine.out"
+    worker_log.write_text(
+        "Ignore import error when loading optional plugin\n"
+        "SGLang request aborted during weight update\n"
+    )
+
+    logger = logging.getLogger("test.ray_log_mirror_benign")
+    logger.handlers.clear()
+    logger.propagate = False
+    records = Records()
+    logger.addHandler(records)
+    mirror = RayLogMirror(logs, logger=logger)
+
+    mirror.poll_once()
+
+    assert records.messages == []

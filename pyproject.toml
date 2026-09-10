@@ -19,6 +19,7 @@ tracking = ["swanlab>=0.9.6,<1"]
 [project.scripts]
 noise-rl = "noise_rl.cli:main"
 noise-rl-sft-data = "noise_rl.sft_data:main"
+noise-rl-awm-manifest = "noise_rl.awm_manifest:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -16,7 +16,35 @@ export PYTHONPATH=/workspace/OpenEnv/src:/workspace/OpenEnv/envs:${PYTHONPATH:-}
 
 ## 数据
 
-创建 JSONL manifest，每行例如（场景和任务编号须存在于本地 AWM 服务）：
+使用 `scripts/build_awm_manifest.sh` 从本地 AgentWorldModel-1K 的七个 JSONL
+文件生成训练和 `valid_unseen` manifest。它复现 OpenEnv 的场景名归一化，要求每个
+任务都有 pure-code verifier，并以**完整 scenario** 为单位做确定性切分；不会下载
+数据、导入 OpenEnv 或联系 AWM 服务：
+
+```bash
+AWM_DATA_DIR=/datasets/AgentWorldModel-1K \
+AWM_TRAIN_MANIFEST=data/awm/train.jsonl \
+AWM_VALID_UNSEEN_MANIFEST=data/awm/valid_unseen.jsonl \
+AWM_MANIFEST_REPORT=data/awm/split-report.json \
+bash scripts/build_awm_manifest.sh
+```
+
+默认以 seed `20260910` 留出 20% scenario。固定 `AWM_SPLIT_SEED` 和
+`AWM_VALID_SCENARIO_FRACTION`，并把生成的 `split-report.json` 与论文实验记录一同保存。
+脚本拒绝覆盖已有输出，以免意外改变数据划分。
+
+可选的 `AWM_READ_ONLY_TOOLS` 是一个人工审计的 JSON 映射；`_default` 为所有未单独
+列出的 scenario 提供显式默认值。例如：
+
+```json
+{
+  "_default": [],
+  "e_commerce_33": ["search_products"]
+}
+```
+
+未提供该文件时，所有工具均视为可能写入（保守但可运行）。生成后的 JSONL 每行例如
+（场景和任务编号须存在于本地 AWM 服务）：
 
 ```json
 {"prompt":"Complete the tool-use task.","metadata":{"task":{"id":"awm/e_commerce_33/0","environment":"awm","split":"train","scenario":"e_commerce_33","task_idx":0,"read_only_tools":["search_products"]}}}

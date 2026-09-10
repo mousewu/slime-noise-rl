@@ -106,6 +106,25 @@ def _pure_code_verifier_index(rows: list[dict], path: Path) -> dict[str, set[int
     return result
 
 
+def _validate_sql_verifier_rows(rows: list[dict], path: Path) -> None:
+    """Validate SQL-judge records without assuming a unique candidate per task.
+
+    The upstream ``gen_verifier.jsonl`` may contain multiple LLM-judge
+    candidates for one ``(scenario, task_idx)``.  OpenEnv returns the first
+    matching candidate, while this project never uses SQL verification at all.
+    Only the pure-code file has the one-verifier-per-task contract needed by
+    the training harness.
+    """
+    for line_number, row in enumerate(rows, 1):
+        try:
+            normalize_scenario_name(row["scenario"])
+            task_idx = row["task_idx"]
+        except (KeyError, ValueError) as exc:
+            raise ValueError(f"Invalid SQL verifier record in {path}:{line_number}") from exc
+        if type(task_idx) is not int or task_idx < 0:
+            raise ValueError(f"Invalid task_idx in {path}:{line_number}")
+
+
 def _load_catalog(data_root: str | Path) -> dict[str, list[str]]:
     root = Path(data_root).expanduser().resolve(strict=True)
     if not root.is_dir():
@@ -130,10 +149,10 @@ def _load_catalog(data_root: str | Path) -> dict[str, list[str]]:
                 f"Scenario mismatch for {filename}: missing={missing[:5]}, unexpected={unexpected[:5]}"
             )
 
-    # The project uses only code verification, but parse the SQL verifier file
-    # too: the local data directory should be complete enough for the server
-    # started by train_awm_4gpu.sh.
-    _pure_code_verifier_index(rows["gen_verifier.jsonl"], paths["gen_verifier.jsonl"])
+    # The project uses only code verification, but validate the SQL verifier
+    # file too: the local data directory should be complete enough for the
+    # server started by train_awm_4gpu.sh.  SQL records are not unique by task.
+    _validate_sql_verifier_rows(rows["gen_verifier.jsonl"], paths["gen_verifier.jsonl"])
     code_verifiers = _pure_code_verifier_index(
         rows["gen_verifier.pure_code.jsonl"], paths["gen_verifier.pure_code.jsonl"]
     )

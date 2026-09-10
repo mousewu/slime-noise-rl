@@ -49,6 +49,11 @@ def test_normalization_matches_openenv_contract():
 
 def test_manifest_builder_partitions_complete_scenarios_and_records_audit(tmp_path):
     root = make_awm_data(tmp_path)
+    # The SQL/LLM verifier source may keep multiple candidates for one task;
+    # only pure-code verifier coverage must be one-to-one.
+    sql_verifier = root / "gen_verifier.jsonl"
+    sql_rows = [json.loads(line) for line in sql_verifier.read_text(encoding="utf-8").splitlines()]
+    write_jsonl(sql_verifier, sql_rows + [sql_rows[0]])
     policy = tmp_path / "read-only.json"
     policy.write_text(
         json.dumps({"_default": ["inspect"], "E-Commerce 33": ["search_products"]}),

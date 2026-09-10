@@ -25,6 +25,7 @@ def options(tmp_path):
         tensor_parallel=2,
         engine_gpus=2,
         batch_size=16,
+        num_steps_per_rollout=1,
         hf_checkpoint="/models/hf",
         megatron_checkpoint="/models/megatron",
         data="/data/train.jsonl",
@@ -94,6 +95,7 @@ def test_launch_budgets_hooks_and_checkpoint_placeholders(tmp_path):
 
     assert int(value("--rollout-batch-size")) * int(value("--n-samples-per-prompt")) == 128
     assert value("--global-batch-size") == "128"
+    assert value("--num-steps-per-rollout") == "1"
     assert value("--over-sampling-batch-size") == value("--rollout-batch-size")
     assert value("--custom-reward-post-process-path") == "noise_rl.slime_hooks.reward_postprocess"
     assert value("--save-hf").format(rollout_id=3).endswith("rollout_3")
@@ -107,6 +109,31 @@ def test_launch_budgets_hooks_and_checkpoint_placeholders(tmp_path):
     args.debug_rollout_only = True
     command = build_command(args, ExperimentConfig())
     assert value("--save-debug-rollout-data").format(rollout_id="eval_3").endswith("rollout_eval_3.pt")
+
+
+def test_steps_per_rollout_derives_slime_global_batch(tmp_path, monkeypatch):
+    args = options(tmp_path)
+    args.num_steps_per_rollout = 2
+    monkeypatch.setattr(launch, "model_arguments", lambda _slime: [])
+
+    command = build_command(args, ExperimentConfig())
+
+    def value(key):
+        return command[command.index(key) + 1]
+
+    assert value("--rollout-batch-size") == "16"
+    assert value("--n-samples-per-prompt") == "8"
+    assert value("--num-steps-per-rollout") == "2"
+    assert value("--global-batch-size") == "64"
+
+
+def test_steps_per_rollout_requires_an_even_rollout_sample_count(tmp_path, monkeypatch):
+    args = options(tmp_path)
+    args.num_steps_per_rollout = 3
+    monkeypatch.setattr(launch, "model_arguments", lambda _slime: [])
+
+    with pytest.raises(ValueError, match="must be divisible"):
+        build_command(args, ExperimentConfig())
 
 
 def test_invalid_parallelism_rejected_before_launch(tmp_path):

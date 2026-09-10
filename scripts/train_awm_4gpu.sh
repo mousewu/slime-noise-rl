@@ -19,6 +19,7 @@ TASK_PYTHON_BIN="${PYTHON_BIN:-python}"
 TASK_CONFIG="${CONFIG:-${TASK_PROJECT_DIR}/configs/matched_loo_awm_4gpu.yaml}"
 TASK_OUTPUT="${OUTPUT:-${TASK_PROJECT_DIR}/runs/awm-4gpu-$(date -u +%Y%m%d-%H%M%S)-$$}"
 TASK_BATCH_SIZE="${BATCH_SIZE:-8}"
+TASK_NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 TASK_NUM_ROLLOUT="${NUM_ROLLOUT:-600}"
 TASK_SAVE_INTERVAL="${SAVE_INTERVAL:-50}"
 TASK_SEED="${SEED:-42}"
@@ -37,8 +38,8 @@ for TASK_FLAG in "${TASK_INSTALL_DEPS}" "${TASK_START_SERVER}" "${TASK_USE_SWANL
   case "${TASK_FLAG}" in 0|1) ;; *) echo "Boolean options must be 0 or 1" >&2; exit 2 ;; esac
 done
 case "${TASK_SWANLAB_MODE}" in online|offline|local) ;; *) echo "SWANLAB_MODE must be online, offline, or local" >&2; exit 2 ;; esac
-for TASK_NUMBER in "${TASK_BATCH_SIZE}" "${TASK_NUM_ROLLOUT}" "${TASK_SAVE_INTERVAL}" "${TASK_MAX_TOKENS_PER_GPU}"; do
-  case "${TASK_NUMBER}" in ''|*[!0-9]*|0) echo "Batch, rollout, save, and token values must be positive integers" >&2; exit 2 ;; esac
+for TASK_NUMBER in "${TASK_BATCH_SIZE}" "${TASK_NUM_STEPS_PER_ROLLOUT}" "${TASK_NUM_ROLLOUT}" "${TASK_SAVE_INTERVAL}" "${TASK_MAX_TOKENS_PER_GPU}"; do
+  case "${TASK_NUMBER}" in ''|*[!0-9]*|0) echo "Batch, steps-per-rollout, rollout, save, and token values must be positive integers" >&2; exit 2 ;; esac
 done
 
 for TASK_DIRECTORY in "${SLIME_DIR}" "${MEGATRON_LM_DIR}" "${OPENENV_DIR}" "${HF_CHECKPOINT}" "${MEGATRON_CHECKPOINT}"; do
@@ -209,6 +210,7 @@ TASK_TRAIN_ARGS=(
   --tensor-parallel 2
   --engine-gpus 2
   --batch-size "${TASK_BATCH_SIZE}"
+  --num-steps-per-rollout "${TASK_NUM_STEPS_PER_ROLLOUT}"
   --num-rollout "${TASK_NUM_ROLLOUT}"
   --save-interval "${TASK_SAVE_INTERVAL}"
   --max-tokens-per-gpu "${TASK_MAX_TOKENS_PER_GPU}"

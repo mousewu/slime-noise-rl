@@ -47,6 +47,12 @@ A_i=R_i-\frac{1}{|B|-1}\sum_{j\in B,j\ne i}R_j.
 
 奖励后处理在Slime分发到DP worker之前完成，并按显式任务/情景标识分组；不依赖输入列表顺序。处理后返回 `(raw_rewards, advantages)`；最初验证的Slime GRPO路径把后者广播为token级return，不再做另一次组归一化。更换Slime版本后需要通过contract test和短程训练确认该行为未变。
 
+启动器默认 `--num-steps-per-rollout=1`。若显式增大为 \(S\)，Slime 会将同一 rollout
+产生的 `rollout_batch_size × n_samples_per_prompt` 条轨迹均分到 \(S\) 次优化；因此启动器自动
+传入 `global_batch_size = rollout_batch_size × n_samples_per_prompt / S`，并要求整除及每步 batch
+可被训练 DP 大小整除。比较算法时必须固定该参数；它改变的是优化/样本复用方案，而不是单纯的
+运行时间开关。
+
 ## Harness 与训练的边界
 
 环境、故障注入、重试、chat framing、停止条件都参与rollout生成。训练梯度只作用于模型生成token。工具反馈、人工添加的角色分隔符和下一轮assistant前缀的loss mask均为0。

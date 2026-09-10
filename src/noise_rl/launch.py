@@ -96,14 +96,26 @@ def model_arguments(slime_dir):
 def build_command(args, config, fully_async=False):
     slime = Path(args.slime_dir).expanduser().resolve()
     output = Path(args.output).expanduser().resolve()
-    batch = args.batch_size * config.group_size
+    rollout_samples = args.batch_size * config.group_size
+    num_steps_per_rollout = getattr(args, "num_steps_per_rollout", 1)
+    if type(num_steps_per_rollout) is not int or num_steps_per_rollout < 1:
+        raise ValueError("num_steps_per_rollout must be a positive integer")
+    if rollout_samples % num_steps_per_rollout:
+        raise ValueError(
+            "rollout_batch_size * n_samples_per_prompt must be divisible by "
+            "num_steps_per_rollout"
+        )
+    # Slime consumes one rollout batch across this many optimizer steps.  Its
+    # argument validator requires the per-step global batch, not the number of
+    # trajectories produced by the whole rollout.
+    global_batch = rollout_samples // num_steps_per_rollout
     actor_gpus = args.actor_gpus if fully_async else args.gpus
     rollout_gpus = args.rollout_gpus if fully_async else args.gpus
     if actor_gpus < 1 or args.tensor_parallel < 1 or actor_gpus % args.tensor_parallel:
         raise ValueError("GPU count must be divisible by tensor parallelism")
     if rollout_gpus < 1 or rollout_gpus % args.engine_gpus:
         raise ValueError("Rollout GPU count must be divisible by GPUs per rollout engine")
-    if batch % (actor_gpus // args.tensor_parallel):
+    if global_batch % (actor_gpus // args.tensor_parallel):
         raise ValueError("Global batch must be divisible by data-parallel size")
     entry_module = "noise_rl.train_async_entry" if fully_async else "noise_rl.train_entry"
     command = [sys.executable, "-m", entry_module, str(slime)] + model_arguments(slime)
@@ -148,9 +160,9 @@ def build_command(args, config, fully_async=False):
         "--n-samples-per-prompt",
         str(config.group_size),
         "--global-batch-size",
-        str(batch),
+        str(global_batch),
         "--num-steps-per-rollout",
-        "1",
+        str(num_steps_per_rollout),
         "--rollout-max-response-len",
         str(config.max_generated_tokens),
         "--rollout-max-context-len",
@@ -295,6 +307,15 @@ def main(argv=None, fully_async=False):
     parser.add_argument("--tensor-parallel", type=int, default=2)
     parser.add_argument("--engine-gpus", type=int, default=2)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--num-steps-per-rollout",
+        type=int,
+        default=1,
+        help=(
+            "Optimizer steps per rollout batch; Slime splits the rollout samples evenly "
+            "across these steps and the launcher derives --global-batch-size."
+        ),
+    )
     parser.add_argument("--num-rollout", type=int, default=300)
     parser.add_argument("--save-interval", type=int, default=25)
     parser.add_argument("--eval-interval", type=int, default=25)
@@ -335,6 +356,7 @@ def main(argv=None, fully_async=False):
     for key in (
         "engine_gpus",
         "batch_size",
+        "num_steps_per_rollout",
         "num_rollout",
         "save_interval",
         "eval_interval",

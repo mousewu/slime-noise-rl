@@ -54,6 +54,11 @@ def test_manifest_builder_partitions_complete_scenarios_and_records_audit(tmp_pa
     sql_verifier = root / "gen_verifier.jsonl"
     sql_rows = [json.loads(line) for line in sql_verifier.read_text(encoding="utf-8").splitlines()]
     write_jsonl(sql_verifier, sql_rows + [sql_rows[0]])
+    pure_code_verifier = root / "gen_verifier.pure_code.jsonl"
+    pure_code_rows = [
+        json.loads(line) for line in pure_code_verifier.read_text(encoding="utf-8").splitlines()
+    ]
+    write_jsonl(pure_code_verifier, pure_code_rows + [pure_code_rows[0]])
     policy = tmp_path / "read-only.json"
     policy.write_text(
         json.dumps({"_default": ["inspect"], "E-Commerce 33": ["search_products"]}),
@@ -93,7 +98,7 @@ def test_manifest_builder_partitions_complete_scenarios_and_records_audit(tmp_pa
     assert json.loads(report_path.read_text(encoding="utf-8"))["valid_unseen"]["task_count"] == 4
 
 
-def test_manifest_builder_rejects_missing_pure_code_verifier_before_writing(tmp_path):
+def test_manifest_builder_excludes_task_without_pure_code_verifier(tmp_path):
     root = make_awm_data(tmp_path)
     verifier = root / "gen_verifier.pure_code.jsonl"
     rows = [json.loads(line) for line in verifier.read_text(encoding="utf-8").splitlines()]
@@ -101,9 +106,15 @@ def test_manifest_builder_rejects_missing_pure_code_verifier_before_writing(tmp_
 
     train_path = tmp_path / "train.jsonl"
     valid_path = tmp_path / "valid.jsonl"
-    with pytest.raises(ValueError, match="Pure-code verifier coverage mismatch"):
-        build_awm_manifests(root, train_path, valid_path, valid_scenario_fraction=0.5)
-    assert not train_path.exists() and not valid_path.exists()
+    report = build_awm_manifests(root, train_path, valid_path, valid_scenario_fraction=0.5)
+
+    ids = {
+        row["metadata"]["task"]["id"]
+        for row in read_records(train_path) + read_records(valid_path)
+    }
+    assert "awm/warehouse_9/1" not in ids
+    assert len(ids) == 7
+    assert report["pure_code_verifier"]["excluded_task_count"] == 1
 
 
 def test_manifest_builder_never_overwrites_existing_outputs(tmp_path):

@@ -17,8 +17,8 @@ export PYTHONPATH=/workspace/OpenEnv/src:/workspace/OpenEnv/envs:${PYTHONPATH:-}
 ## 数据
 
 使用 `scripts/build_awm_manifest.sh` 从本地 AgentWorldModel-1K 的七个 JSONL
-文件生成训练和 `valid_unseen` manifest。它复现 OpenEnv 的场景名归一化，要求每个
-任务都有 pure-code verifier，并以**完整 scenario** 为单位做确定性切分；不会下载
+文件生成训练和 `valid_unseen` manifest。它复现 OpenEnv 的场景名归一化，只生成具有
+至少一个 pure-code verifier 的任务，并以**完整 scenario** 为单位做确定性切分；不会下载
 数据、导入 OpenEnv 或联系 AWM 服务：
 
 ```bash
@@ -31,7 +31,7 @@ bash scripts/build_awm_manifest.sh
 
 默认以 seed `20260910` 留出 20% scenario。固定 `AWM_SPLIT_SEED` 和
 `AWM_VALID_SCENARIO_FRACTION`，并把生成的 `split-report.json` 与论文实验记录一同保存。
-脚本拒绝覆盖已有输出，以免意外改变数据划分。
+报告会列出被排除的无 pure-code verifier 任务；脚本拒绝覆盖已有输出，以免意外改变数据划分。
 
 可选的 `AWM_READ_ONLY_TOOLS` 是一个人工审计的 JSON 映射；`_default` 为所有未单独
 列出的 scenario 提供显式默认值。例如：

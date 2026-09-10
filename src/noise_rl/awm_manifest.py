@@ -90,6 +90,7 @@ def _task_index(rows: list[dict], path: Path) -> dict[str, list[str]]:
 
 
 def _pure_code_verifier_index(rows: list[dict], path: Path) -> dict[str, set[int]]:
+    """Return pure-code verifier coverage; upstream may retain candidates."""
     result = {}
     for line_number, row in enumerate(rows, 1):
         try:
@@ -99,10 +100,11 @@ def _pure_code_verifier_index(rows: list[dict], path: Path) -> dict[str, set[int
             raise ValueError(f"Invalid pure-code verifier record in {path}:{line_number}") from exc
         if type(task_idx) is not int or task_idx < 0:
             raise ValueError(f"Invalid task_idx in {path}:{line_number}")
-        indices = result.setdefault(scenario, set())
-        if task_idx in indices:
-            raise ValueError(f"Duplicate code verifier for {scenario}/{task_idx} in {path}")
-        indices.add(task_idx)
+        # OpenEnv's loader returns the first matching record in file order.
+        # Both verifier files can retain multiple candidate implementations for
+        # the same task, so manifest construction checks coverage, not
+        # uniqueness.  The split report records the source-file SHA-256.
+        result.setdefault(scenario, set()).add(task_idx)
     return result
 
 
@@ -112,8 +114,7 @@ def _validate_sql_verifier_rows(rows: list[dict], path: Path) -> None:
     The upstream ``gen_verifier.jsonl`` may contain multiple LLM-judge
     candidates for one ``(scenario, task_idx)``.  OpenEnv returns the first
     matching candidate, while this project never uses SQL verification at all.
-    Only the pure-code file has the one-verifier-per-task contract needed by
-    the training harness.
+    The pure-code file is likewise checked for task coverage below.
     """
     for line_number, row in enumerate(rows, 1):
         try:
@@ -125,7 +126,7 @@ def _validate_sql_verifier_rows(rows: list[dict], path: Path) -> None:
             raise ValueError(f"Invalid task_idx in {path}:{line_number}")
 
 
-def _load_catalog(data_root: str | Path) -> dict[str, list[str]]:
+def _load_catalog(data_root: str | Path) -> tuple[dict[str, list[int]], dict]:
     root = Path(data_root).expanduser().resolve(strict=True)
     if not root.is_dir():
         raise NotADirectoryError(f"AWM data root must be a directory: {root}")
@@ -156,15 +157,28 @@ def _load_catalog(data_root: str | Path) -> dict[str, list[str]]:
     code_verifiers = _pure_code_verifier_index(
         rows["gen_verifier.pure_code.jsonl"], paths["gen_verifier.pure_code.jsonl"]
     )
+    catalog, missing_code_verifiers, unexpected_code_verifiers = {}, {}, {}
     for scenario, task_list in tasks.items():
         expected = set(range(len(task_list)))
         actual = code_verifiers.get(scenario, set())
-        if actual != expected:
-            raise ValueError(
-                f"Pure-code verifier coverage mismatch for {scenario}: "
-                f"missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}"
-            )
-    return {scenario: tasks[scenario] for scenario in sorted(scenario_names)}
+        eligible = sorted(expected & actual)
+        if eligible:
+            catalog[scenario] = eligible
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        if missing:
+            missing_code_verifiers[scenario] = missing
+        if unexpected:
+            unexpected_code_verifiers[scenario] = unexpected
+    if not catalog:
+        raise ValueError("No AWM tasks have a pure-code verifier")
+    return catalog, {
+        "eligible_scenario_count": len(catalog),
+        "eligible_task_count": sum(len(indices) for indices in catalog.values()),
+        "excluded_scenarios": sorted(scenario_names - set(catalog)),
+        "missing_task_indices": missing_code_verifiers,
+        "unexpected_verifier_indices": unexpected_code_verifiers,
+    }
 
 
 def _read_only_policy(path: str | Path | None, scenario_names: set[str]) -> tuple[list[str], dict[str, list[str]]]:
@@ -212,7 +226,7 @@ def _holdout_scenarios(scenarios: list[str], fraction: float, seed: int) -> set[
 
 
 def _manifest_rows(
-    catalog: dict[str, list[str]],
+    catalog: dict[str, list[int]],
     selected_scenarios: set[str],
     split: str,
     prompt: str,
@@ -225,7 +239,7 @@ def _manifest_rows(
         raise ValueError("prompt must be a nonempty string")
     rows = []
     for scenario in sorted(selected_scenarios):
-        for task_idx, _task_text in enumerate(catalog[scenario]):
+        for task_idx in catalog[scenario]:
             rows.append(
                 {
                     "prompt": prompt,
@@ -275,7 +289,7 @@ def build_awm_manifests(
     report_output: str | Path | None = None,
 ) -> dict:
     """Build non-overlapping train and valid-unseen AWM manifests without downloads."""
-    catalog = _load_catalog(data_root)
+    catalog, verifier_audit = _load_catalog(data_root)
     train_output = Path(train_output).expanduser()
     valid_output = Path(valid_unseen_output).expanduser()
     report_path = Path(report_output).expanduser() if report_output else None
@@ -333,6 +347,12 @@ def build_awm_manifests(
         "source_files": {
             name: _file_sha256(Path(data_root).expanduser().resolve() / name)
             for name in REQUIRED_AWM_FILES
+        },
+        "pure_code_verifier": {
+            **verifier_audit,
+            "excluded_task_count": sum(
+                len(indices) for indices in verifier_audit["missing_task_indices"].values()
+            ),
         },
         "seed": seed,
         "valid_scenario_fraction": valid_scenario_fraction,

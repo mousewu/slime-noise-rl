@@ -57,6 +57,29 @@ bash scripts/build_awm_manifest.sh
 `AWM_VALID_SCENARIO_FRACTION`，并把生成的 `split-report.json` 与论文实验记录一同保存。
 报告会列出被排除的无 pure-code verifier 任务；脚本拒绝覆盖已有输出，以免意外改变数据划分。
 
+### 初始上下文审计（必做）
+
+AWM 的初始 observation 包含任务和完整工具 schema，其 token 数不能只从原始 JSONL
+推断，必须由已启动的本地 AWM 服务实际 reset 后测量。训练前运行：
+
+```bash
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+AWM_MANIFEST=data/awm/train.jsonl \
+AWM_CONTEXT_MANIFEST=data/awm/train.ctx16k.jsonl \
+AWM_CONTEXT_REPORT=data/awm/train.ctx16k.report.json \
+HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507 \
+AWM_URL=http://127.0.0.1:8899 \
+MAX_CONTEXT_TOKENS=16384 \
+bash scripts/audit_awm_context.sh
+```
+
+该工具使用 rollout 相同的 WebSocket reset、code-verifier 检查、保留工具列表、AWM
+system prompt 和 Qwen chat template。它保留满足严格条件
+`initial_prompt_tokens < MAX_CONTEXT_TOKENS` 的原始 manifest 行，并将所有排除任务及
+token 统计写进 report。输出和 report 都不可覆盖。任何 AWM 服务/协议错误都会终止审计且
+不写输出，避免因暂时性服务故障悄悄改变训练分布。训练时把 `AWM_MANIFEST` 指向该新文件；
+它不替代训练中后续多轮 context budget 的正常截断统计。
+
 可选的 `AWM_READ_ONLY_TOOLS` 是一个人工审计的 JSON 映射；`_default` 为所有未单独
 列出的 scenario 提供显式默认值。例如：
 
@@ -84,6 +107,23 @@ bash scripts/build_awm_manifest.sh
 依赖，校验四张可见 GPU、两个本地 checkpoint、manifest、NumPy 1.x 和 AWM 服务可达性；
 不会安装 OpenEnv/AWM 或修改 Slime 的 CUDA 运行栈。服务端由
 `scripts/start_awm_server.sh` 单独负责。完整环境变量示例见脚本开头和 README。
+
+八卡使用独立的 `scripts/train_awm_8gpu.sh`，固定拓扑为 **2 actor + 6 rollout**：actor
+为 TP=2，rollout 为三个 TP=2 SGLang engine。脚本默认总 `CONCURRENCY=48`，启动器将其
+均分为每 engine 16；`environment_workers` 仍先保持 32，因为应先依据
+`rollout/environment_queue_seconds` 判断环境是否真有瓶颈。请先完成上面的 16K context
+审计，再执行：
+
+```bash
+AWM_MANIFEST=data/awm/train.ctx16k.jsonl \
+MAX_CONTEXT_TOKENS=16384 MAX_TOKENS_PER_GPU=16384 \
+bash scripts/train_awm_8gpu.sh
+```
+
+`MAX_CONTEXT_TOKENS`、`CONCURRENCY` 和 `ENVIRONMENT_WORKERS` 可在两个训练脚本中直接
+覆盖，无须复制 YAML；它们会被写入运行时配置和 SwanLab 元数据。`MAX_TOKENS_PER_GPU`
+必须不小于实际 context 上限。7 张 rollout 卡加 2 张 actor 卡需要 9 张物理 GPU，且 7
+不能被当前每 engine 2 卡的布局整除。
 
 ## 动作、奖励与实验条件
 

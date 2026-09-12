@@ -165,6 +165,23 @@ def test_fully_async_command_is_non_colocated_and_uses_official_rollout(tmp_path
     assert "--eval-function-path" not in command
 
 
+def test_fully_async_six_rollout_gpus_create_three_tp2_engines(tmp_path, monkeypatch):
+    args = options(tmp_path)
+    args.actor_gpus = 2
+    args.rollout_gpus = 6
+    monkeypatch.setattr(launch, "model_arguments", lambda _slime: [])
+
+    command = build_command(args, ExperimentConfig(concurrency=48), fully_async=True)
+
+    def value(key):
+        return command[command.index(key) + 1]
+
+    assert value("--actor-num-gpus-per-node") == "2"
+    assert value("--rollout-num-gpus") == "6"
+    assert value("--rollout-num-gpus-per-engine") == "2"
+    assert value("--sglang-server-concurrency") == "16"
+
+
 def test_fully_async_requires_rollout_gpu_count_to_match_engine_tp(tmp_path, monkeypatch):
     args = options(tmp_path)
     args.actor_gpus = 4

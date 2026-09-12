@@ -236,6 +236,34 @@ bash scripts/train_awm_4gpu.sh
 
 默认参数为 actor 2卡、rollout 2卡、TP=2、batch-size=8、600 个 rollout、每 50 轮保存。短跑可加 `BATCH_SIZE=2 NUM_ROLLOUT=3 SAVE_INTERVAL=1`。`INSTALL_DEPS=1` 现在只安装训练端项目和 SwanLab，不再安装 OpenEnv/AWM；依赖已安装时设置 `INSTALL_DEPS=0`。也可用 `START_AWM_SERVER=1` 由训练脚本代启服务，但仍必须传入独立的 `AWM_SERVER_PYTHON_BIN`、`OPENENV_DIR` 与 `AWM_DATA_DIR`。
 
+AWM 将完整工具 schema 放入初始 observation；不能假定所有任务都落在固定上下文预算内。先用正在运行的本地 AWM 服务和本地 Qwen tokenizer 生成一个不可覆盖的过滤 manifest，再训练：
+
+```bash
+AWM_MANIFEST=/workspace/slime-noise-rl/data/awm/train.jsonl \
+AWM_CONTEXT_MANIFEST=/workspace/slime-noise-rl/data/awm/train.ctx16k.jsonl \
+AWM_CONTEXT_REPORT=/workspace/slime-noise-rl/data/awm/train.ctx16k.report.json \
+HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507 \
+AWM_URL=http://127.0.0.1:8899 \
+MAX_CONTEXT_TOKENS=16384 \
+bash scripts/audit_awm_context.sh
+```
+
+审计会使用 rollout 完全相同的 reset、工具过滤、system prompt 与 chat template；初始 prompt token 数严格小于 `MAX_CONTEXT_TOKENS` 的任务才会进入新 manifest。服务端错误会使审计失败，绝不会静默删任务。训练时改用 `AWM_MANIFEST=data/awm/train.ctx16k.jsonl`。
+
+8 张 A100 使用 actor 2 卡、rollout 6 卡（3 个 TP=2 engine），不能配置为“7 rollout + 2 train”——那需要 9 卡。8 卡脚本默认 `MAX_CONTEXT_TOKENS=MAX_TOKENS_PER_GPU=16384`、总 `CONCURRENCY=48`，即每个 rollout engine 16 请求：
+
+```bash
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+SLIME_DIR=/workspace/slime \
+MEGATRON_LM_DIR=/workspace/Megatron-LM \
+AWM_MANIFEST=/workspace/slime-noise-rl/data/awm/train.ctx16k.jsonl \
+HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507 \
+MEGATRON_CHECKPOINT=/models/Qwen3-4B-Instruct-2507_torch_dist \
+RUNTIME_TMPDIR=/data/noise-rl-tmp \
+START_AWM_SERVER=0 AWM_URL=http://127.0.0.1:8899 \
+bash scripts/train_awm_8gpu.sh
+```
+
 默认：单节点8卡、训练 TP=2、4个双卡 rollout engine、colocate、8K上下文、每条轨迹最多2048个模型生成 token、单次输出最多96 token、40个模型回合、50次环境调用。故障概率默认 action-drop=0.15、observation-loss=0.10。
 
 `concurrency` 是全局 SGLang 请求容量：主配置设为 32，在 8 卡、每个 engine 2 卡时对应每个 rollout engine 8 条并发请求。`environment_workers` 只服务于普通的进程内同步环境调用。

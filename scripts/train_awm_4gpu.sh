@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Four-GPU fully-async AWM recipe. The trainer never imports or installs
-# OpenEnv/AWM: those NumPy-2 server dependencies are isolated in a separate
-# AWM server environment. Model checkpoints and the manifest must be local.
+# AWM fully-async recipe core.  The four-GPU wrapper keeps the historical
+# defaults; train_awm_8gpu.sh invokes this same checked path with a 2+6 split.
+# The trainer never imports or installs OpenEnv/AWM: those NumPy-2 server
+# dependencies are isolated in a separate AWM server environment. Model
+# checkpoints and the manifest must be local.
 
 TASK_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TASK_PYTHON_BIN="${PYTHON_BIN:-python}"
@@ -15,14 +17,23 @@ TASK_PYTHON_BIN="${PYTHON_BIN:-python}"
 : "${MEGATRON_CHECKPOINT:?Set MEGATRON_CHECKPOINT to the local Megatron checkpoint}"
 : "${RUNTIME_TMPDIR:?Set RUNTIME_TMPDIR to a large local disk directory}"
 
+TASK_TOTAL_GPUS="${AWM_TOTAL_GPUS:-4}"
+TASK_ACTOR_GPUS="${AWM_ACTOR_GPUS:-2}"
+TASK_ROLLOUT_GPUS="${AWM_ROLLOUT_GPUS:-2}"
+TASK_TENSOR_PARALLEL="${TENSOR_PARALLEL:-2}"
+TASK_ENGINE_GPUS="${ENGINE_GPUS:-2}"
+TASK_GPU_LABEL="${AWM_GPU_LABEL:-${TASK_TOTAL_GPUS}gpu}"
 TASK_CONFIG="${CONFIG:-${TASK_PROJECT_DIR}/configs/matched_loo_awm_4gpu.yaml}"
-TASK_OUTPUT="${OUTPUT:-${TASK_PROJECT_DIR}/runs/awm-4gpu-$(date -u +%Y%m%d-%H%M%S)-$$}"
+TASK_OUTPUT="${OUTPUT:-${TASK_PROJECT_DIR}/runs/awm-${TASK_GPU_LABEL}-$(date -u +%Y%m%d-%H%M%S)-$$}"
 TASK_BATCH_SIZE="${BATCH_SIZE:-8}"
 TASK_NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 TASK_NUM_ROLLOUT="${NUM_ROLLOUT:-600}"
 TASK_SAVE_INTERVAL="${SAVE_INTERVAL:-50}"
 TASK_SEED="${SEED:-42}"
-TASK_MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-9216}"
+TASK_MAX_CONTEXT_TOKENS="${MAX_CONTEXT_TOKENS:-}"
+TASK_MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-${TASK_MAX_CONTEXT_TOKENS:-16384}}"
+TASK_CONCURRENCY="${CONCURRENCY:-}"
+TASK_ENVIRONMENT_WORKERS="${ENVIRONMENT_WORKERS:-}"
 TASK_INSTALL_DEPS="${INSTALL_DEPS:-1}"
 TASK_START_SERVER="${START_AWM_SERVER:-0}"
 TASK_AWM_HOST="${AWM_HOST:-127.0.0.1}"
@@ -38,9 +49,29 @@ for TASK_FLAG in "${TASK_INSTALL_DEPS}" "${TASK_START_SERVER}" "${TASK_USE_SWANL
   case "${TASK_FLAG}" in 0|1) ;; *) echo "Boolean options must be 0 or 1" >&2; exit 2 ;; esac
 done
 case "${TASK_SWANLAB_MODE}" in online|offline|local) ;; *) echo "SWANLAB_MODE must be online, offline, or local" >&2; exit 2 ;; esac
-for TASK_NUMBER in "${TASK_BATCH_SIZE}" "${TASK_NUM_STEPS_PER_ROLLOUT}" "${TASK_NUM_ROLLOUT}" "${TASK_SAVE_INTERVAL}" "${TASK_MAX_TOKENS_PER_GPU}"; do
-  case "${TASK_NUMBER}" in ''|*[!0-9]*|0) echo "Batch, steps-per-rollout, rollout, save, and token values must be positive integers" >&2; exit 2 ;; esac
+for TASK_NUMBER in \
+  "${TASK_TOTAL_GPUS}" "${TASK_ACTOR_GPUS}" "${TASK_ROLLOUT_GPUS}" \
+  "${TASK_TENSOR_PARALLEL}" "${TASK_ENGINE_GPUS}" "${TASK_BATCH_SIZE}" \
+  "${TASK_NUM_STEPS_PER_ROLLOUT}" "${TASK_NUM_ROLLOUT}" "${TASK_SAVE_INTERVAL}" \
+  "${TASK_MAX_TOKENS_PER_GPU}"; do
+  case "${TASK_NUMBER}" in ''|*[!0-9]*|0) echo "GPU, batch, rollout, save, and token values must be positive integers" >&2; exit 2 ;; esac
 done
+for TASK_NUMBER in "${TASK_MAX_CONTEXT_TOKENS}" "${TASK_CONCURRENCY}" "${TASK_ENVIRONMENT_WORKERS}"; do
+  [[ -z "${TASK_NUMBER}" ]] && continue
+  case "${TASK_NUMBER}" in *[!0-9]*|0) echo "Optional context, concurrency, and environment-worker values must be positive integers" >&2; exit 2 ;; esac
+done
+if (( TASK_ACTOR_GPUS + TASK_ROLLOUT_GPUS != TASK_TOTAL_GPUS )); then
+  echo "AWM_ACTOR_GPUS plus AWM_ROLLOUT_GPUS must equal AWM_TOTAL_GPUS" >&2
+  exit 2
+fi
+if (( TASK_ACTOR_GPUS % TASK_TENSOR_PARALLEL != 0 )); then
+  echo "AWM_ACTOR_GPUS must be divisible by TENSOR_PARALLEL" >&2
+  exit 2
+fi
+if (( TASK_ROLLOUT_GPUS % TASK_ENGINE_GPUS != 0 )); then
+  echo "AWM_ROLLOUT_GPUS must be divisible by ENGINE_GPUS" >&2
+  exit 2
+fi
 
 for TASK_DIRECTORY in "${SLIME_DIR}" "${MEGATRON_LM_DIR}" "${HF_CHECKPOINT}" "${MEGATRON_CHECKPOINT}"; do
   if [[ ! -d "${TASK_DIRECTORY}" ]]; then
@@ -74,7 +105,9 @@ export MEGATRON_LM_DIR="$(cd -- "${MEGATRON_LM_DIR}" && pwd)"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  export CUDA_VISIBLE_DEVICES="$(seq -s, 0 "$((TASK_TOTAL_GPUS - 1))")"
+fi
 export AWM_URL="${TASK_AWM_URL}"
 export PYTHONPATH="${MEGATRON_LM_DIR}:${TASK_PROJECT_DIR}/src:${SLIME_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -87,8 +120,8 @@ else
   echo "[1/6] Dependency installation disabled by INSTALL_DEPS=0"
 fi
 
-echo "[2/6] Checking isolated trainer runtime and four visible GPUs"
-"${TASK_PYTHON_BIN}" - "${SLIME_DIR}" <<'PY'
+echo "[2/6] Checking isolated trainer runtime and ${TASK_TOTAL_GPUS} visible GPUs"
+"${TASK_PYTHON_BIN}" - "${SLIME_DIR}" "${TASK_TOTAL_GPUS}" <<'PY'
 import importlib
 import sys
 
@@ -107,11 +140,12 @@ if int(numpy.__version__.split(".", 1)[0]) >= 2:
         f"Megatron trainer requires NumPy 1.x, found {numpy.__version__}. "
         "Use a dedicated trainer environment; do not install OpenEnv/AWM into it."
     )
-if not torch.cuda.is_available() or torch.cuda.device_count() != 4:
-    raise RuntimeError(f"Expected exactly four visible GPUs, found {torch.cuda.device_count()}")
+expected_gpus = int(sys.argv[2])
+if not torch.cuda.is_available() or torch.cuda.device_count() != expected_gpus:
+    raise RuntimeError(f"Expected exactly {expected_gpus} visible GPUs, found {torch.cuda.device_count()}")
 if not torch.cuda.is_bf16_supported():
     raise RuntimeError("This recipe requires BF16-capable GPUs")
-print("GPUs:", [torch.cuda.get_device_name(i) for i in range(4)])
+print("GPUs:", [torch.cuda.get_device_name(i) for i in range(expected_gpus)])
 PY
 
 echo "[3/6] Validating local checkpoints, AWM manifest, and offline data"
@@ -189,32 +223,41 @@ TASK_TRAIN_ARGS=(
   --megatron-checkpoint "${MEGATRON_CHECKPOINT}"
   --output "${TASK_OUTPUT}"
   --seed "${TASK_SEED}"
-  --gpus 4
-  --actor-gpus 2
-  --rollout-gpus 2
-  --tensor-parallel 2
-  --engine-gpus 2
+  --gpus "${TASK_TOTAL_GPUS}"
+  --actor-gpus "${TASK_ACTOR_GPUS}"
+  --rollout-gpus "${TASK_ROLLOUT_GPUS}"
+  --tensor-parallel "${TASK_TENSOR_PARALLEL}"
+  --engine-gpus "${TASK_ENGINE_GPUS}"
   --batch-size "${TASK_BATCH_SIZE}"
   --num-steps-per-rollout "${TASK_NUM_STEPS_PER_ROLLOUT}"
   --num-rollout "${TASK_NUM_ROLLOUT}"
   --save-interval "${TASK_SAVE_INTERVAL}"
   --max-tokens-per-gpu "${TASK_MAX_TOKENS_PER_GPU}"
 )
+if [[ -n "${TASK_MAX_CONTEXT_TOKENS}" ]]; then
+  TASK_TRAIN_ARGS+=(--max-context-tokens "${TASK_MAX_CONTEXT_TOKENS}")
+fi
+if [[ -n "${TASK_CONCURRENCY}" ]]; then
+  TASK_TRAIN_ARGS+=(--concurrency "${TASK_CONCURRENCY}")
+fi
+if [[ -n "${TASK_ENVIRONMENT_WORKERS}" ]]; then
+  TASK_TRAIN_ARGS+=(--environment-workers "${TASK_ENVIRONMENT_WORKERS}")
+fi
 if [[ "${TASK_USE_SWANLAB}" == 1 ]]; then
   TASK_TRAIN_ARGS+=(
     --use-swanlab
     --swanlab-mode "${TASK_SWANLAB_MODE}"
     --swanlab-project "${SWANLAB_PROJECT:-agentic-noise-rl}"
     --swanlab-experiment-name "${SWANLAB_EXPERIMENT_NAME:-$(basename -- "${TASK_OUTPUT}")}"
-    --swanlab-group "${SWANLAB_GROUP:-awm-4gpu}"
-    --swanlab-tags awm fully-async 4gpu qwen3-4b
+    --swanlab-group "${SWANLAB_GROUP:-awm-${TASK_GPU_LABEL}}"
+    --swanlab-tags awm fully-async "${TASK_GPU_LABEL}" qwen3-4b
   )
 fi
 
 echo "[5/6] Validating the complete training command"
 bash "${TASK_PROJECT_DIR}/scripts/train_fully_async.sh" "${TASK_TRAIN_ARGS[@]}" --dry-run
 
-echo "[6/6] Starting four-GPU fully-async AWM training"
+echo "[6/6] Starting ${TASK_TOTAL_GPUS}-GPU fully-async AWM training (actor=${TASK_ACTOR_GPUS}, rollout=${TASK_ROLLOUT_GPUS}, engine=${TASK_ENGINE_GPUS})"
 echo "Output: ${TASK_OUTPUT}"
 echo "AWM server log: ${TASK_SERVER_LOG}"
 bash "${TASK_PROJECT_DIR}/scripts/train_fully_async.sh" "${TASK_TRAIN_ARGS[@]}"

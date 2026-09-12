@@ -322,6 +322,21 @@ def main(argv=None, fully_async=False):
     parser.add_argument("--eval-repeats", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-6)
     parser.add_argument("--max-tokens-per-gpu", type=int, default=9216)
+    parser.add_argument(
+        "--max-context-tokens",
+        type=int,
+        help="Override noise_rl.max_context_tokens without editing the base YAML",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        help="Override noise_rl.concurrency (the total SGLang request capacity)",
+    )
+    parser.add_argument(
+        "--environment-workers",
+        type=int,
+        help="Override noise_rl.environment_workers without changing the base YAML",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--use-swanlab", action="store_true")
     parser.add_argument("--swanlab-project", default="slime-noise-rl")
@@ -367,11 +382,15 @@ def main(argv=None, fully_async=False):
             parser.error(f"{key} must be positive")
     if args.lr <= 0:
         parser.error("lr must be positive")
-    config = replace(
-        load_config(args.config),
-        seed=args.seed,
-        trace_dir=str(Path(args.output).expanduser().resolve() / "traces"),
-    )
+    overrides = {
+        "seed": args.seed,
+        "trace_dir": str(Path(args.output).expanduser().resolve() / "traces"),
+    }
+    for key in ("max_context_tokens", "concurrency", "environment_workers"):
+        value = getattr(args, key)
+        if value is not None:
+            overrides[key] = value
+    config = replace(load_config(args.config), **overrides)
     if os.environ.get("AWM_URL"):
         config = replace(config, awm_url=os.environ["AWM_URL"])
     if args.max_tokens_per_gpu < config.max_context_tokens:

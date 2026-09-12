@@ -4,17 +4,17 @@ noise_rl:
   scenarios: 2
   baseline: loo
   std_normalization: false
-  # One TP=2 rollout engine; 16 concurrent model requests/groups keeps up to
-  # roughly 128 stateful AWM trajectory sessions alive (16 groups x 8 samples).
-  concurrency: 16
+  # Three TP=2 rollout engines.  The launcher divides this total capacity by
+  # engine count, yielding 16 concurrent requests for each engine.
+  concurrency: 48
   environment_workers: 32
   environment_processes: 0
-  # Override at launch with AWM_URL when the service is not local.
   awm_url: http://127.0.0.1:8899
   max_turns: 40
   max_tool_calls: 50
-  # The initial AWM prompt contains complete tool schemas.  Build and use a
-  # context-audited manifest before training; this is the strict prompt limit.
+  # AWM injects the full tool schema into the first user observation.  Run
+  # scripts/audit_awm_context.sh before training and do not admit a task whose
+  # initial prompt reaches this strict budget.
   max_context_tokens: 16384
   max_generated_tokens: 2048
   max_tokens_per_turn: 256

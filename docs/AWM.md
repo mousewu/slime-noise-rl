@@ -70,6 +70,14 @@ bash scripts/train_awm_4gpu.sh
 `AWM_SERVER_LOG` 应为服务器的专用输出文件，不能重定向为训练进程的 stdout/stderr，以免造成
 日志回环；只在训练命令设置该变量不会为已经运行的前台服务器追溯生成日志。
 
+服务启动器还会在**不修改 OpenEnv 工作树文件**的前提下，使用项目的运行时入口包装 AWM。
+当生成 scenario 子进程的 MCP 工具返回 500、或 code verifier 返回非
+`complete`/`incomplete` 时，包装器会在 session 清理前读取该子进程 `server.log` 的末尾，连同
+scenario、task、工具参数、原始错误和 verifier 结果写进外层服务日志。因此它也会被上面的
+SwanLab 镜像捕获，并在 `${AWM_DIAGNOSTICS_DIR:-$RUNTIME_TMPDIR/awm-session-diagnostics}` 留下一个
+JSON 文件。默认每次保留末尾 24 KiB，可用 `NOISE_RL_AWM_SUBPROCESS_LOG_TAIL_BYTES` 调整，上限
+为 256 KiB。
+
 每条轨迹创建独立 WebSocket session；网络操作通过后台 asyncio loop 执行，环境接口通过现有有界线程池等待返回。AWM 不使用 ALFWorld 的进程池。`environment_workers` 控制同时进行的环境请求数量，`concurrency` 控制模型侧容量，服务器 session 上限必须覆盖全部活跃轨迹（包含正在等待模型的轨迹）。先以 32/64/128 活跃轨迹逐级压测，不能把最大连接数当作实际吞吐。
 
 ## 数据

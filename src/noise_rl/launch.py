@@ -385,9 +385,12 @@ def main(argv=None, fully_async=False):
             raise ValueError("AWM manifest requires noise_rl.awm_url")
         if not args.dry_run:
             try:
-                from agent_world_model_env import AWMEnv  # noqa: F401
+                from websockets.asyncio.client import connect  # noqa: F401
             except ImportError as exc:
-                raise RuntimeError("AWM requires the prepared OpenEnv src and envs directories on PYTHONPATH; see docs/AWM.md") from exc
+                raise RuntimeError(
+                    "AWM trainer requires the lightweight 'websockets' package, not OpenEnv; "
+                    "install slime-noise-rl in the Megatron training environment; see docs/AWM.md"
+                ) from exc
     if any(r["metadata"]["task"].get("split") != "train" for r in training):
         raise ValueError("Training tasks must be from split=train")
     if args.eval_data:

@@ -209,21 +209,32 @@ SFT 是奖励稀疏的解决起点，而不是论文结论：应至少比较 “
 
 可选 AWM MCP 工具环境使用独立配置 `configs/matched_loo_awm.yaml`；见 [AWM 部署、数据与训练说明](docs/AWM.md)。原有 ALFWorld 配置保持独立。
 
-四卡 AWM fully-async 一键启动脚本（模型、checkpoint、OpenEnv 源码、AWM 数据和 manifest 均须预先位于本地）：
+AWM 服务端和训练端使用不同 Python 环境：AWM/OpenEnv 的 NumPy 2.x 依赖不能进入
+Megatron 的 NumPy 1.x 训练环境。先启动独立服务端（本地数据和源码均须预先准备）：
 
 ```bash
-SLIME_DIR=/workspace/slime \
-MEGATRON_LM_DIR=/workspace/Megatron-LM \
+AWM_SERVER_PYTHON_BIN=/opt/conda/envs/awm-server/bin/python \
 OPENENV_DIR=/workspace/OpenEnv \
 AWM_DATA_DIR=/datasets/AgentWorldModel-1K \
+RUNTIME_TMPDIR=/data/awm-tmp \
+bash scripts/start_awm_server.sh
+```
+
+再从 Megatron/Slime 训练环境执行四卡 fully-async：
+
+```bash
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+SLIME_DIR=/workspace/slime \
+MEGATRON_LM_DIR=/workspace/Megatron-LM \
 AWM_MANIFEST=/workspace/slime-noise-rl/data/awm/train.jsonl \
 HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507 \
 MEGATRON_CHECKPOINT=/models/Qwen3-4B-Instruct-2507_torch_dist \
 RUNTIME_TMPDIR=/data/noise-rl-tmp \
+START_AWM_SERVER=0 AWM_URL=http://127.0.0.1:8899 \
 bash scripts/train_awm_4gpu.sh
 ```
 
-默认参数为 actor 2卡、rollout 2卡、TP=2、batch-size=8、600 个 rollout、每 50 轮保存。短跑可加 `BATCH_SIZE=2 NUM_ROLLOUT=3 SAVE_INTERVAL=1`。已有 AWM 服务时设置 `START_AWM_SERVER=0 AWM_URL=http://host:port`；无需 SwanLab 时设置 `USE_SWANLAB=0`；依赖已安装时设置 `INSTALL_DEPS=0`。
+默认参数为 actor 2卡、rollout 2卡、TP=2、batch-size=8、600 个 rollout、每 50 轮保存。短跑可加 `BATCH_SIZE=2 NUM_ROLLOUT=3 SAVE_INTERVAL=1`。`INSTALL_DEPS=1` 现在只安装训练端项目和 SwanLab，不再安装 OpenEnv/AWM；依赖已安装时设置 `INSTALL_DEPS=0`。也可用 `START_AWM_SERVER=1` 由训练脚本代启服务，但仍必须传入独立的 `AWM_SERVER_PYTHON_BIN`、`OPENENV_DIR` 与 `AWM_DATA_DIR`。
 
 默认：单节点8卡、训练 TP=2、4个双卡 rollout engine、colocate、8K上下文、每条轨迹最多2048个模型生成 token、单次输出最多96 token、40个模型回合、50次环境调用。故障概率默认 action-drop=0.15、observation-loss=0.10。
 

@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Four-GPU fully-async AWM recipe.  Slime, Megatron-LM, model checkpoints,
-# OpenEnv source, AWM data, and the training manifest must already be local.
-# This script installs Python packages, but never downloads model or task data.
+# Four-GPU fully-async AWM recipe. The trainer never imports or installs
+# OpenEnv/AWM: those NumPy-2 server dependencies are isolated in a separate
+# AWM server environment. Model checkpoints and the manifest must be local.
 
 TASK_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TASK_PYTHON_BIN="${PYTHON_BIN:-python}"
 
 : "${SLIME_DIR:?Set SLIME_DIR to the local Slime checkout}"
 : "${MEGATRON_LM_DIR:?Set MEGATRON_LM_DIR to the local Megatron-LM source tree}"
-: "${OPENENV_DIR:?Set OPENENV_DIR to the local Hugging Face OpenEnv checkout}"
 : "${AWM_MANIFEST:?Set AWM_MANIFEST to the local AWM training JSONL manifest}"
 : "${HF_CHECKPOINT:?Set HF_CHECKPOINT to the local Hugging Face checkpoint}"
 : "${MEGATRON_CHECKPOINT:?Set MEGATRON_CHECKPOINT to the local Megatron checkpoint}"
@@ -25,14 +24,15 @@ TASK_SAVE_INTERVAL="${SAVE_INTERVAL:-50}"
 TASK_SEED="${SEED:-42}"
 TASK_MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-9216}"
 TASK_INSTALL_DEPS="${INSTALL_DEPS:-1}"
-TASK_START_SERVER="${START_AWM_SERVER:-1}"
-TASK_AWM_DATA_DIR="${AWM_DATA_DIR:-}"
+TASK_START_SERVER="${START_AWM_SERVER:-0}"
 TASK_AWM_HOST="${AWM_HOST:-127.0.0.1}"
 TASK_AWM_PORT="${AWM_PORT:-8899}"
 TASK_AWM_URL="${AWM_URL:-http://${TASK_AWM_HOST}:${TASK_AWM_PORT}}"
 TASK_USE_SWANLAB="${USE_SWANLAB:-1}"
 TASK_SWANLAB_MODE="${SWANLAB_MODE:-online}"
 TASK_SERVER_LOG="${AWM_SERVER_LOG:-${RUNTIME_TMPDIR}/awm-server-${TASK_AWM_PORT}-$$.log}"
+TASK_SERVER_PID_FILE="${AWM_SERVER_PID_FILE:-${RUNTIME_TMPDIR}/awm-server-${TASK_AWM_PORT}-$$.pid}"
+TASK_AWM_SERVER_SCRIPT="${AWM_SERVER_SCRIPT:-${TASK_PROJECT_DIR}/scripts/start_awm_server.sh}"
 
 for TASK_FLAG in "${TASK_INSTALL_DEPS}" "${TASK_START_SERVER}" "${TASK_USE_SWANLAB}"; do
   case "${TASK_FLAG}" in 0|1) ;; *) echo "Boolean options must be 0 or 1" >&2; exit 2 ;; esac
@@ -42,18 +42,12 @@ for TASK_NUMBER in "${TASK_BATCH_SIZE}" "${TASK_NUM_STEPS_PER_ROLLOUT}" "${TASK_
   case "${TASK_NUMBER}" in ''|*[!0-9]*|0) echo "Batch, steps-per-rollout, rollout, save, and token values must be positive integers" >&2; exit 2 ;; esac
 done
 
-for TASK_DIRECTORY in "${SLIME_DIR}" "${MEGATRON_LM_DIR}" "${OPENENV_DIR}" "${HF_CHECKPOINT}" "${MEGATRON_CHECKPOINT}"; do
+for TASK_DIRECTORY in "${SLIME_DIR}" "${MEGATRON_LM_DIR}" "${HF_CHECKPOINT}" "${MEGATRON_CHECKPOINT}"; do
   if [[ ! -d "${TASK_DIRECTORY}" ]]; then
     echo "Required local directory does not exist: ${TASK_DIRECTORY}" >&2
     exit 2
   fi
 done
-if [[ "${TASK_START_SERVER}" == 1 ]]; then
-  if [[ -z "${TASK_AWM_DATA_DIR}" || ! -d "${TASK_AWM_DATA_DIR}" ]]; then
-    echo "Starting a local server requires AWM_DATA_DIR with the prepared AgentWorldModel-1K files" >&2
-    exit 2
-  fi
-fi
 for TASK_FILE in "${AWM_MANIFEST}" "${TASK_CONFIG}"; do
   if [[ ! -f "${TASK_FILE}" ]]; then
     echo "Required local file does not exist: ${TASK_FILE}" >&2
@@ -64,8 +58,8 @@ if [[ ! -d "${MEGATRON_LM_DIR}/megatron/training" ]]; then
   echo "MEGATRON_LM_DIR must contain megatron/training" >&2
   exit 2
 fi
-if [[ ! -f "${OPENENV_DIR}/pyproject.toml" || ! -f "${OPENENV_DIR}/envs/agent_world_model_env/pyproject.toml" ]]; then
-  echo "OPENENV_DIR must contain OpenEnv and envs/agent_world_model_env" >&2
+if [[ "${TASK_START_SERVER}" == 1 && ! -x "${TASK_AWM_SERVER_SCRIPT}" ]]; then
+  echo "AWM_SERVER_SCRIPT must be an executable server launcher: ${TASK_AWM_SERVER_SCRIPT}" >&2
   exit 2
 fi
 if [[ -e "${TASK_OUTPUT}" ]]; then
@@ -73,47 +67,27 @@ if [[ -e "${TASK_OUTPUT}" ]]; then
   exit 2
 fi
 
-TASK_AWM_FILES=(
-  gen_scenario.jsonl gen_tasks.jsonl gen_db.jsonl gen_sample.jsonl
-  gen_envs.jsonl gen_verifier.jsonl gen_verifier.pure_code.jsonl
-)
-if [[ "${TASK_START_SERVER}" == 1 ]]; then
-  for TASK_AWM_FILE in "${TASK_AWM_FILES[@]}"; do
-    if [[ ! -f "${TASK_AWM_DATA_DIR}/${TASK_AWM_FILE}" ]]; then
-      echo "Missing local AWM data file: ${TASK_AWM_DATA_DIR}/${TASK_AWM_FILE}" >&2
-      echo "All seven files are required because network dataset downloads are disabled." >&2
-      exit 2
-    fi
-  done
-fi
-
 mkdir -p -- "${RUNTIME_TMPDIR}"
 export TMPDIR="$(cd -- "${RUNTIME_TMPDIR}" && pwd)"
 export SLIME_DIR="$(cd -- "${SLIME_DIR}" && pwd)"
 export MEGATRON_LM_DIR="$(cd -- "${MEGATRON_LM_DIR}" && pwd)"
-export OPENENV_DIR="$(cd -- "${OPENENV_DIR}" && pwd)"
-if [[ "${TASK_START_SERVER}" == 1 ]]; then
-  export AWM_DATA_DIR="$(cd -- "${TASK_AWM_DATA_DIR}" && pwd)"
-fi
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export AWM_URL="${TASK_AWM_URL}"
-export PYTHONPATH="${MEGATRON_LM_DIR}:${OPENENV_DIR}/src:${OPENENV_DIR}/envs:${TASK_PROJECT_DIR}/src:${SLIME_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${MEGATRON_LM_DIR}:${TASK_PROJECT_DIR}/src:${SLIME_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
 if [[ "${TASK_INSTALL_DEPS}" == 1 ]]; then
-  echo "[1/6] Installing project, OpenEnv/AWM, and SwanLab Python dependencies"
+  echo "[1/6] Installing only trainer-side project and SwanLab dependencies"
   "${TASK_PYTHON_BIN}" -m pip --version >/dev/null
   "${TASK_PYTHON_BIN}" -m pip install \
-    -e "${OPENENV_DIR}" \
-    -e "${OPENENV_DIR}/envs/agent_world_model_env" \
     -e "${TASK_PROJECT_DIR}[tracking]"
 else
   echo "[1/6] Dependency installation disabled by INSTALL_DEPS=0"
 fi
 
-echo "[2/6] Checking Slime runtime, AWM imports, and four visible GPUs"
+echo "[2/6] Checking isolated trainer runtime and four visible GPUs"
 "${TASK_PYTHON_BIN}" - "${SLIME_DIR}" <<'PY'
 import importlib
 import sys
@@ -122,11 +96,17 @@ from noise_rl.launch import verify_slime
 
 verify_slime(sys.argv[1], "train_async.py")
 for package in (
-    "agent_world_model_env", "openenv", "torch", "ray", "sglang",
+    "websockets.asyncio.client", "torch", "ray", "sglang",
     "megatron.core", "megatron.training", "transformer_engine", "flashinfer",
 ):
     importlib.import_module(package)
 import torch
+import numpy
+if int(numpy.__version__.split(".", 1)[0]) >= 2:
+    raise RuntimeError(
+        f"Megatron trainer requires NumPy 1.x, found {numpy.__version__}. "
+        "Use a dedicated trainer environment; do not install OpenEnv/AWM into it."
+    )
 if not torch.cuda.is_available() or torch.cuda.device_count() != 4:
     raise RuntimeError(f"Expected exactly four visible GPUs, found {torch.cuda.device_count()}")
 if not torch.cuda.is_bf16_supported():
@@ -156,16 +136,21 @@ cleanup_awm_server() {
     kill "${TASK_SERVER_PID}"
     wait "${TASK_SERVER_PID}" 2>/dev/null || true
   fi
+  if [[ -n "${TASK_SERVER_PID}" ]]; then
+    rm -f -- "${TASK_SERVER_PID_FILE}"
+  fi
 }
 trap cleanup_awm_server EXIT INT TERM
 
 if [[ "${TASK_START_SERVER}" == 1 ]]; then
-  echo "[4/6] Starting the local AWM server at ${TASK_AWM_URL}"
-  ENABLE_WEB_INTERFACE=false "${TASK_PYTHON_BIN}" -m uvicorn \
-    agent_world_model_env.server.app:app \
-    --host "${TASK_AWM_HOST}" --port "${TASK_AWM_PORT}" \
-    >"${TASK_SERVER_LOG}" 2>&1 &
-  TASK_SERVER_PID=$!
+  echo "[4/6] Starting an isolated local AWM server at ${TASK_AWM_URL}"
+  AWM_SERVER_BACKGROUND=1 \
+  AWM_SERVER_LOG="${TASK_SERVER_LOG}" \
+  AWM_SERVER_PID_FILE="${TASK_SERVER_PID_FILE}" \
+  AWM_HOST="${TASK_AWM_HOST}" \
+  AWM_PORT="${TASK_AWM_PORT}" \
+  bash "${TASK_AWM_SERVER_SCRIPT}"
+  TASK_SERVER_PID="$(<"${TASK_SERVER_PID_FILE}")"
 else
   echo "[4/6] Using the existing AWM server at ${TASK_AWM_URL}"
 fi

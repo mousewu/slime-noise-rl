@@ -1,16 +1,40 @@
 # AWM 环境
 
-通过 manifest 中的 `environment: awm` 选择 AWM；ALFWorld 配置与数据继续使用原启动方式。同步和 fully-async 均可使用 `configs/matched_loo_awm.yaml`。新增功能不修改 Slime，也不自动下载模型、数据或启动环境服务器。
+通过 manifest 中的 `environment: awm` 选择 AWM；ALFWorld 配置与数据继续使用原启动方式。同步和 fully-async 均可使用 `configs/matched_loo_awm.yaml`。新增功能不修改 Slime，也不自动下载模型或数据；默认连接已启动的环境服务器。
 
-## 依赖和服务
+## 隔离的依赖和服务
 
-在已有 OpenEnv 源码及其依赖准备好的环境中，把 OpenEnv 的 `src` 和 `envs` 目录加入 `PYTHONPATH`，使 `openenv` 和 `agent_world_model_env` 可导入。项目训练启动器会保留并传播 PYTHONPATH。
+AWM 服务端与 Slime/Megatron **必须使用两个 Python 环境**。当前 AWM 的
+`mcp-agent==0.2.6` 依赖 NumPy 2.x，而 Megatron 不支持 NumPy 2.x。训练端现在
+使用 AWM 已公开的持久 `/ws` 协议，只依赖轻量 `websockets` 包，**不导入、不安装**
+`openenv`、`agent_world_model_env` 或 `mcp-agent`。
+
+服务端环境准备好 OpenEnv/AWM 后，单独启动本地服务：
 
 ```bash
-export PYTHONPATH=/workspace/OpenEnv/src:/workspace/OpenEnv/envs:${PYTHONPATH:-}
+AWM_SERVER_PYTHON_BIN=/opt/conda/envs/awm-server/bin/python \
+OPENENV_DIR=/workspace/OpenEnv \
+AWM_DATA_DIR=/datasets/AgentWorldModel-1K \
+RUNTIME_TMPDIR=/data/awm-tmp \
+bash scripts/start_awm_server.sh
 ```
 
-单独按 OpenEnv 的 AWM 服务说明准备本地数据并启动服务器，然后在 YAML 设置 `noise_rl.awm_url`。本项目只连接该服务，不调用 from_hub 等下载接口。AWM 服务的数据加载、磁盘目录和会话并发容量由其部署配置负责。
+首次在**服务端环境**安装依赖时，额外设置 `AWM_SERVER_INSTALL_DEPS=1`；它只会在
+该解释器中安装 OpenEnv/AWM。训练环境绝不能设置此变量或把 OpenEnv 加到 `PYTHONPATH`。
+服务端和数据均在本地，脚本不会下载模型或任务数据。
+
+训练端只需安装本项目（它会安装 `websockets`），并连接服务的 URL：
+
+```bash
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+INSTALL_DEPS=1 START_AWM_SERVER=0 \
+AWM_URL=http://127.0.0.1:8899 \
+bash scripts/train_awm_4gpu.sh
+```
+
+训练脚本会拒绝 NumPy 2.x；服务脚本会拒绝 NumPy 1.x，从启动前就阻止两套依赖意外混用。
+`START_AWM_SERVER=1` 仍可作为便利模式：它调用独立服务脚本，因而仍须提供
+`AWM_SERVER_PYTHON_BIN`、`OPENENV_DIR` 和 `AWM_DATA_DIR`，且只会停止它自己启动的服务。
 
 每条轨迹创建独立 WebSocket session；网络操作通过后台 asyncio loop 执行，环境接口通过现有有界线程池等待返回。AWM 不使用 ALFWorld 的进程池。`environment_workers` 控制同时进行的环境请求数量，`concurrency` 控制模型侧容量，服务器 session 上限必须覆盖全部活跃轨迹（包含正在等待模型的轨迹）。先以 32/64/128 活跃轨迹逐级压测，不能把最大连接数当作实际吞吐。
 
@@ -56,7 +80,10 @@ bash scripts/build_awm_manifest.sh
 
 沿用原来的训练命令及本地模型路径，把 `--config` 改为 `configs/matched_loo_awm.yaml`，`--data` 改为 AWM manifest，并选择新的输出目录即可。fully-async 继续使用 `scripts/train_fully_async.sh`，GPU 分配参数保持原设置。
 
-四卡 fully-async 可使用 `scripts/train_awm_4gpu.sh`。脚本安装本项目、OpenEnv/AWM 和 SwanLab 的 Python 依赖，校验四张可见 GPU、两个本地 checkpoint、七个本地 AWM 数据文件及 manifest，并可启动/停止本地 AWM 服务。它不会下载模型或任务数据，也不会安装或修改 Slime 的 CUDA 运行栈。完整环境变量示例见脚本开头和 README。
+四卡 fully-async 可使用 `scripts/train_awm_4gpu.sh`。它只安装训练端项目/SwanLab
+依赖，校验四张可见 GPU、两个本地 checkpoint、manifest、NumPy 1.x 和 AWM 服务可达性；
+不会安装 OpenEnv/AWM 或修改 Slime 的 CUDA 运行栈。服务端由
+`scripts/start_awm_server.sh` 单独负责。完整环境变量示例见脚本开头和 README。
 
 ## 动作、奖励与实验条件
 

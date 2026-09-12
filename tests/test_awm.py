@@ -80,13 +80,67 @@ def test_awm_session_reset_tool_verify_and_close():
     try:
         assert "Write text" in env.reset().observation
         env.step(canonical_action('{"tool_name":"write","arguments":{"text":"A  B"}}'))
-        result = env.step(canonical_action('{"tool_name":"done","arguments":{}}'))
+        result = env.step(canonical_action('{"tool_name":"done","arguments":{"final_answer":"Finished."}}'))
         assert result.success and result.terminated
-        assert calls[-1] == ("verify", {"verifier_mode": "code"})
+        assert result.info["awm"] == {
+            "verifier_reward_type": "complete",
+            "verify_execution_status": None,
+            "final_answer_submitted": True,
+            "final_answer_bytes": 9,
+        }
+        assert calls[-1] == ("verify", {"verifier_mode": "code", "final_answer": "Finished."})
         assert calls[-2] == ("write", {"text": "A  B"})
     finally:
         env.close()
     assert calls[-1] == "closed"
+
+
+def test_awm_others_is_a_normal_zero_reward_terminal_result():
+    calls = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        async def reset(self, **kwargs):
+            return {"observation": {"reward_type": "reset_ok", "has_verifier": {"code": True}, "task": "Read"}}
+
+        async def list_tools(self):
+            return {"observation": {"tools": []}}
+
+        async def call_tool(self, tool_name, arguments):
+            calls.append((tool_name, arguments))
+            return {
+                "observation": {
+                    "reward_type": "others",
+                    "verify_result": {"execution_status": "success", "result": "others"},
+                }
+            }
+
+        async def close(self):
+            pass
+
+    env = AWMEnvironment({"scenario": "test", "task_idx": 0}, "http://localhost:8899", client_factory=Client)
+    try:
+        env.reset()
+        result = env.step(canonical_action('{"tool_name":"done","arguments":{}}'))
+        assert result.terminated and not result.success
+        assert result.info["awm"]["verifier_reward_type"] == "others"
+        assert calls == [("verify", {"verifier_mode": "code"})]
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        '{"tool_name":"done","arguments":{"other":"no"}}',
+        '{"tool_name":"done","arguments":{"final_answer":1}}',
+    ],
+)
+def test_awm_done_action_validates_final_answer_contract(action):
+    with pytest.raises(ValueError):
+        canonical_action(action)
 
 
 def test_awm_websocket_client_uses_public_openenv_protocol():

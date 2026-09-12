@@ -12,11 +12,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .envs import StepResult
 
-SYSTEM_PROMPT = '''Complete the task using the provided tools.
-Reply with exactly one JSON object: {"tool_name":"name","arguments":{...}}.
-Preserve case and whitespace in argument values. Use only listed tools.
-When finished call {"tool_name":"done","arguments":{}}.
-Tools can fail: inspect state before repeating an operation with an uncertain outcome.'''
+SYSTEM_PROMPT = '''Complete the task with the provided tools. Reply with exactly one JSON object:
+{"tool_name":"name","arguments":{...}}. Preserve case and whitespace; use only listed tools.
+Finish with {"tool_name":"done","arguments":{}}. For a requested returned or report answer, use
+{"tool_name":"done","arguments":{"final_answer":"..."}}. Inspect state before retrying an uncertain operation.'''
 
 _LOOP = None
 _LOCK = Lock()
@@ -30,6 +29,14 @@ def canonical_action(text):
         raise ValueError("tool_name must be nonempty")
     if not isinstance(value["arguments"], dict):
         raise ValueError("arguments must be an object")
+    if value["tool_name"] == "done":
+        unsupported = set(value["arguments"]) - {"final_answer"}
+        if unsupported:
+            raise ValueError("done accepts only an optional final_answer argument")
+        if "final_answer" in value["arguments"] and not isinstance(
+            value["arguments"]["final_answer"], str
+        ):
+            raise ValueError("done.final_answer must be a string")
     return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False)
 
 
@@ -213,11 +220,33 @@ class AWMEnvironment:
         value = json.loads(action)
         name, arguments = value["tool_name"], value["arguments"]
         if name == "done":
-            result = await self.client.call_tool("verify", {"verifier_mode": "code"})
+            verify_arguments = {"verifier_mode": "code"}
+            final_answer = arguments.get("final_answer")
+            if final_answer is not None:
+                verify_arguments["final_answer"] = final_answer
+            result = await self.client.call_tool("verify", verify_arguments)
             obs = self._check(result)
-            if _field(obs, "reward_type") not in {"complete", "incomplete"}:
+            reward_type = _field(obs, "reward_type")
+            # OpenEnv's code verifier uses ``others`` for a normal failed
+            # verification.  Older server variants used ``incomplete``.
+            # Both must become a completed zero-reward episode, not a worker
+            # exception that breaks a fully-async comparison group.
+            if reward_type not in {"complete", "incomplete", "others"}:
                 raise RuntimeError(f"Unexpected AWM verifier outcome: {_field(obs, 'reward_type')}")
-            return StepResult("Episode finished.", success=_field(obs, "reward_type") == "complete", terminated=True)
+            verify_result = _field(obs, "verify_result", {})
+            return StepResult(
+                "Episode finished.",
+                success=reward_type == "complete",
+                terminated=True,
+                info={
+                    "awm": {
+                        "verifier_reward_type": reward_type,
+                        "verify_execution_status": _field(verify_result, "execution_status"),
+                        "final_answer_submitted": final_answer is not None,
+                        "final_answer_bytes": len(final_answer.encode("utf-8")) if final_answer else 0,
+                    }
+                },
+            )
         if name not in self.tools:
             return StepResult("FORMAT_ERROR: unknown or reserved tool")
         result = await self.client.call_tool(name, arguments)

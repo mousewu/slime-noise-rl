@@ -100,5 +100,34 @@ def test_awm_mirror_reports_compact_verifier_evidence_metrics(tmp_path):
         "awm/verifier/evidence/disabled_total": 0.0,
         "awm/verifier/evidence/error_total": 0.0,
         "awm/verifier/evidence/db_backups_saved_total": 2.0,
+        "awm/server/tool_server_error/total": 0.0,
+        "awm/server/tool_server_error/unique_tasks": 0.0,
     }
     assert any("scenario=threading_demo task_idx=3" in message for message in records.messages)
+
+
+def test_awm_mirror_counts_structured_tool_server_errors(tmp_path):
+    server_log = tmp_path / "awm-server.log"
+    server_log.write_text(
+        "NOISE_RL_AWM_SUBPROCESS_DIAGNOSTIC "
+        + json.dumps(
+            {
+                "kind": "tool_server_error",
+                "scenario": "demo",
+                "task_idx": 4,
+                "tool_name": "write_record",
+                "diagnostic_path": "/tmp/diagnostic.json",
+            }
+        )
+        + "\n"
+    )
+    forwarded = []
+    logger, records = _logger("test.awm_log_mirror_server_metrics")
+    mirror = AWMServerLogMirror(server_log, logger=logger, metric_reporter=forwarded.append)
+
+    mirror.poll_once()
+    mirror.stop()
+
+    assert forwarded[-1]["awm/server/tool_server_error/total"] == 1
+    assert forwarded[-1]["awm/server/tool_server_error/unique_tasks"] == 1
+    assert any("tool=write_record" in message for message in records.messages)

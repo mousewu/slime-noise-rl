@@ -98,8 +98,9 @@ bundle 目录为 `${AWM_DIAGNOSTICS_DIR}/awm-evidence-*/`，包含：
 - `initial.sqlite`、`final.sqlite`：通过 SQLite backup API 保存的独立一致性快照（包含 WAL 状态）。
 
 先读 `evidence.json` 的 `database.diff` 和 `trajectory.entries`：任务状态已满足而 verifier 仍为
-`others` 时，优先检查 verifier/数据；工具调用返回 5xx 或未改变数据库时，检查环境；状态未满足且调用
-正常时，才属于普通策略失败。默认限制可按一次调试运行临时覆盖：
+`others` 时，优先检查 verifier/数据；明确的 HTTP 5xx 或 `server_error` 才归入服务错误；工具的
+`Input validation error` 是模型参数不符合 schema，不是环境崩溃。未改变数据库对于查询、报表和导出类
+任务可能是正常现象，必须同时检查 verifier 是否读取 `final_answer`。默认限制可按一次调试运行临时覆盖：
 
 ```bash
 NOISE_RL_AWM_EVIDENCE_MAX_BUNDLES=100 \
@@ -135,11 +136,34 @@ bash scripts/summarize_awm_evidence.sh
 - `summary.json`：机器可读总计数、verifier 结果和无效 JSON 路径；
 - `samples.tsv`：便于 `column -ts $'\\t' samples.tsv | less -S` 浏览；
 - `samples.jsonl`：每条证据的任务、真实业务工具调用、数据库变更和分类。
+- `final_answer_audit.tsv`：所有“调用工具但未写数据库”的样本，以及 verifier 是否在函数体中读取
+  `final_answer`；
+- `priority_verifier_review.tsv`：所有“数据库已变但 verifier 未通过”的样本，按工具调用数升序排列，
+  并保留真实工具参数，供逐条比对数据库和 verifier。
 
 分类只陈述证据可直接支持的事实：`submitted_done_without_business_tool`、
 `business_tool_calls_without_database_change`、`database_changed_but_verifier_noncomplete` 和
-`tool_or_service_error`。最后一类之前必须先检查完整 bundle；第三类也不能直接等同于
-verifier bug，仍须将最终数据库状态逐项和任务、verifier 源码比对。
+`tool_input_validation_error`、`tool_server_error`、`tool_execution_error`。汇总器不再通过工具正常返回
+内容中出现的 `error`、`failed` 等文字推断失败；第三类也不能直接等同于 verifier bug，仍须将最终数据库
+状态逐项和任务、verifier 源码比对。
+
+### Harness smoke（无模型、无反向传播）
+
+在开始或恢复 RL 前，使用运行中的本地 AWM 服务验证项目 adapter 是否能转发 `final_answer`，以及 code
+verifier 返回正常的 `others` 时是否作为零奖励终止而非使 worker 崩溃：
+
+```bash
+cd /path/to/slime-noise-rl
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+AWM_MANIFEST=data/awm/train.ctx16k.jsonl \
+AWM_URL=http://127.0.0.1:8899 \
+AWM_HARNESS_SMOKE_OUTPUT=runs/awm-harness-smoke.jsonl \
+bash scripts/smoke_awm_harness.sh
+```
+
+它只执行 reset 和隐藏的 code verify，不调用任务业务工具、不下载数据、不启动 SGLang，也不会反向传播。
+输出 JSONL 与同名 `.summary.json` 必须满足：`errors=0`、`terminated=tasks_run`、
+`final_answer_submitted=tasks_run`。这只验证 adapter/服务协议，不表示模型能完成任务。
 
 ## 数据
 
@@ -232,7 +256,23 @@ bash scripts/train_awm_8gpu.sh
 
 模型输出 `{"tool_name":"...","arguments":{...}}`，参数的大小写和内部空格保持原样。噪声以排序后的完整 JSON 调用为键；action-drop 在发送前发生，observation-loss 在收到结果后发生。ALFWorld 仍使用原来的字符串动作格式。
 
-模型用 `{"tool_name":"done","arguments":{}}` 提交。项目以 `verifier_mode: code` 调用隐藏 verifier，将 complete/incomplete 映射为 1/0 后结束轨迹；不向模型开放 verify 或全局场景查询工具。预算耗尽而未提交时奖励为 0。结束提交免 action-drop；普通工具的只读分类由 manifest 决定。Verifier、工具 schema 和会话存储路径不会作为奖励提示泄露，模型仅看到任务、可用工具和工具结果。
+模型用 `{"tool_name":"done","arguments":{}}` 提交。对于检索、生成、汇总、导出或返回结果的任务，模型可用
+`{"tool_name":"done","arguments":{"final_answer":"..."}}` 提交最终答案；项目将它随隐藏 code verifier 的
+`final_answer` 参数转发。code verifier 的 `complete` 得到奖励 1；OpenEnv 当前的正常未通过结果 `others`（以及
+兼容旧版本的 `incomplete`）得到奖励 0 并正常结束，不会使 fully-async worker crash。不向模型开放 verify 或全局
+场景查询工具。预算耗尽而未提交时奖励为 0。结束提交免 action-drop；普通工具的只读分类由 manifest 决定。Verifier、
+工具 schema 和会话存储路径不会作为奖励提示泄露，模型仅看到任务、可用工具和工具结果。
+
+每个训练/评测 trace 现在保留 `environment_info.awm` 的 verifier 状态；SwanLab 会记录：
+
+- `rollout/awm/done_first_rate`：未执行业务工具就提交 `done` 的 AWM episode 比例；
+- `rollout/awm/final_answer_submitted_rate`：所有 `done` 中带非空 `final_answer` 的比例；
+- `rollout/awm/tool_input_validation_errors/total`：被工具 schema 拒绝的调用数；
+- `rollout/awm/verifier/{complete,others,incomplete}_rate`：已终止 AWM episode 的 verifier 结果比例。
+
+独立 AWM 服务通过结构化诊断标记额外记录 `awm/server/tool_server_error/total` 和
+`awm/server/tool_server_error/unique_tasks`；它们只统计明确的 `server_error`，不将模型的 input
+validation error 误计为服务故障，因此不提供没有分母支持的“服务错误率”。
 
 基础设施错误直接抛出，不当作奖励 0。会话在 finally 关闭，不自动重试可能已经生效的远程写操作。默认不保留服务端数据库快照，项目 traces 继续保存动作、观察和噪声审计。
 

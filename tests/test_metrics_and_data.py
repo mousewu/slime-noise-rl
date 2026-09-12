@@ -107,6 +107,65 @@ def test_trace_metrics_covers_rollout_costs_and_fault_rates():
     assert metrics["rollout/termination/success_rate"] == 0.5
 
 
+def test_trace_metrics_include_awm_submission_and_schema_grounding_signals():
+    records = [
+        {
+            "environment": "awm",
+            "plan": {"task_id": "awm/a"},
+            "success": False,
+            "generated_tokens": 3,
+            "inference_input_tokens": 5,
+            "context_tokens": 8,
+            "tool_calls": 1,
+            "turns": 1,
+            "format_errors": 0,
+            "elapsed_seconds": 1,
+            "termination": "environment_terminal",
+            "fault_audit": [],
+            "steps": [
+                {
+                    "action": '{"arguments":{"final_answer":"result"},"tool_name":"done"}',
+                    "observation": "Episode finished.",
+                    "environment_info": {"awm": {"verifier_reward_type": "others"}},
+                }
+            ],
+        },
+        {
+            "environment": "awm",
+            "plan": {"task_id": "awm/b"},
+            "success": False,
+            "generated_tokens": 4,
+            "inference_input_tokens": 6,
+            "context_tokens": 10,
+            "tool_calls": 2,
+            "turns": 2,
+            "format_errors": 0,
+            "elapsed_seconds": 2,
+            "termination": "environment_terminal",
+            "fault_audit": [],
+            "steps": [
+                {
+                    "action": '{"arguments":{"value":null},"tool_name":"create"}',
+                    "observation": "Input validation error: value must be an integer",
+                    "environment_info": {},
+                },
+                {
+                    "action": '{"arguments":{},"tool_name":"done"}',
+                    "observation": "Episode finished.",
+                    "environment_info": {"awm": {"verifier_reward_type": "complete"}},
+                },
+            ],
+        },
+    ]
+    metrics = trace_metrics(records, prefix="rollout", step=8)
+    assert metrics["rollout/awm/episodes"] == 2
+    assert metrics["rollout/awm/done_first_rate"] == 0.5
+    assert metrics["rollout/awm/final_answer_submitted_rate"] == 0.5
+    assert metrics["rollout/awm/tool_input_validation_errors/total"] == 1
+    assert metrics["rollout/awm/verifier/others_rate"] == 0.5
+    assert metrics["rollout/awm/verifier/complete_rate"] == 0.5
+
+
 @pytest.mark.parametrize("damage", ["seed", "conditions", "missing", "duplicate", "training"])
 def test_invalid_paired_evaluation_rejected(damage):
     a = [episode("a", 0, False)]

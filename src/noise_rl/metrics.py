@@ -1,3 +1,4 @@
+import json
 import math
 import random
 from collections import Counter, defaultdict
@@ -16,10 +17,11 @@ def episode_record(
     checkpoint=None,
 ):
     return {
-        "schema": 4,
+        "schema": 5,
         "plan": plan.to_dict(),
         "config": config.to_dict(),
         "checkpoint": checkpoint,
+        "environment": trajectory.environment,
         "success": trajectory.success,
         "termination": trajectory.termination,
         "generated_tokens": trajectory.generated_tokens,
@@ -183,7 +185,73 @@ def trace_metrics(
     }
     for termination, value in terminations.items():
         metrics[f"{prefix}/termination/{termination}_rate"] = value / count
+    metrics.update(_awm_trace_metrics(records, prefix=prefix))
     return metrics
+
+
+def _awm_action(step: dict) -> dict | None:
+    """Decode the project-owned AWM action format without guessing other environments."""
+    action = step.get("action")
+    if not isinstance(action, str):
+        return None
+    try:
+        value = json.loads(action)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(value, dict) or not isinstance(value.get("tool_name"), str):
+        return None
+    return value
+
+
+def _awm_trace_metrics(records: list[dict], *, prefix: str) -> dict[str, int | float]:
+    """Summarize AWM submission and schema-grounding signals for SwanLab.
+
+    These are episode-level facts extracted from project traces.  In
+    particular, ``done_first`` means no business tool action preceded a done
+    submission; it is not a claim that the model never emitted malformed text.
+    """
+    awm_records = [record for record in records if record.get("environment") == "awm"]
+    if not awm_records:
+        return {}
+    done_submissions = done_first = final_answers = input_validation_errors = 0
+    verifier_outcomes: Counter[str] = Counter()
+    for record in awm_records:
+        actions = [_awm_action(step) for step in record.get("steps", [])]
+        actions = [action for action in actions if action is not None]
+        done_index = next(
+            (index for index, action in enumerate(actions) if action["tool_name"] == "done"), None
+        )
+        if done_index is not None:
+            done_submissions += 1
+            if not any(action["tool_name"] not in {"done", "verify", "list_tools"} for action in actions[:done_index]):
+                done_first += 1
+            answer = actions[done_index].get("arguments", {}).get("final_answer")
+            if isinstance(answer, str) and answer.strip():
+                final_answers += 1
+        for step in record.get("steps", []):
+            if "input validation error" in str(step.get("observation", "")).lower():
+                input_validation_errors += 1
+            environment_info = step.get("environment_info", {})
+            awm_info = environment_info.get("awm", {}) if isinstance(environment_info, dict) else {}
+            outcome = awm_info.get("verifier_reward_type")
+            if isinstance(outcome, str):
+                verifier_outcomes[outcome] += 1
+    episode_count = len(awm_records)
+    result: dict[str, int | float] = {
+        f"{prefix}/awm/episodes": episode_count,
+        f"{prefix}/awm/done_submissions/total": done_submissions,
+        f"{prefix}/awm/done_submission_rate": done_submissions / episode_count,
+        f"{prefix}/awm/done_first/total": done_first,
+        f"{prefix}/awm/done_first_rate": done_first / episode_count,
+        f"{prefix}/awm/final_answer_submitted/total": final_answers,
+        f"{prefix}/awm/final_answer_submitted_rate": (
+            final_answers / done_submissions if done_submissions else 0.0
+        ),
+        f"{prefix}/awm/tool_input_validation_errors/total": input_validation_errors,
+    }
+    for outcome, value in verifier_outcomes.items():
+        result[f"{prefix}/awm/verifier/{outcome}_rate"] = value / episode_count
+    return result
 
 
 def paired_comparison(left: list[dict], right: list[dict]):

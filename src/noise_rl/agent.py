@@ -246,6 +246,7 @@ class Segment:
 class Trajectory:
     prompt_text: str
     prompt_tokens: list[int]
+    environment: str = ""
     segments: list[Segment] = field(default_factory=list)
     success: bool = False
     termination: str = "pending"
@@ -444,6 +445,7 @@ async def run_episode(
             trajectory = Trajectory(
                 prompt,
                 prompt_tokens,
+                environment=str(task.get("environment", "")),
                 in_flight_episodes_at_start=in_flight_at_start,
                 environment_runner_wait_seconds=runner_wait_seconds,
             )
@@ -577,6 +579,7 @@ async def run_episode(
                             "action": action,
                             "format_error": False,
                             "observation": observation,
+                            "environment_info": result.info,
                         }
                     )
                     trajectory.success = result.success

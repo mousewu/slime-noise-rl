@@ -9,11 +9,12 @@ Megatron environment.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import threading
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 from time import monotonic
 
@@ -32,6 +33,8 @@ _DEDUP_SECONDS = 60.0
 _MAX_DEDUP_ENTRIES = 1024
 _DEFAULT_CONTEXT_LINES = 12
 _DEFAULT_FOLLOWUP_LINES = 20
+_VERIFIER_EVIDENCE_PREFIX = "NOISE_RL_AWM_VERIFIER_EVIDENCE "
+_DEFAULT_METRIC_FLUSH_SECONDS = 5.0
 
 
 def _redact(value: str) -> str:
@@ -70,6 +73,7 @@ class AWMServerLogMirror:
         context_lines: int = _DEFAULT_CONTEXT_LINES,
         followup_lines: int = _DEFAULT_FOLLOWUP_LINES,
         logger: logging.Logger | None = None,
+        metric_reporter=None,
     ):
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
@@ -84,6 +88,11 @@ class AWMServerLogMirror:
         self._offset: int | None = None
         self._followups = 0
         self._recent_errors: dict[str, float] = {}
+        self._metric_reporter = metric_reporter
+        self._verifier_evidence = Counter()
+        self._verifier_tasks: set[tuple[str, str]] = set()
+        self._verifier_metrics_dirty = False
+        self._last_verifier_metric = monotonic()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -99,12 +108,14 @@ class AWMServerLogMirror:
         if self._thread is not None:
             self._thread.join(timeout=max(2.0, self.poll_seconds * 2))
             self._thread = None
+        self._flush_verifier_metrics(force=True)
 
     def poll_once(self) -> None:
         """Read newly appended server-log lines once; public for tests/final flush."""
         try:
             size = self.log_path.stat().st_size
         except OSError:
+            self._flush_verifier_metrics()
             return
         offset = self._offset
         if offset is None:
@@ -113,6 +124,7 @@ class AWMServerLogMirror:
             offset = 0
         if size <= offset:
             self._offset = offset
+            self._flush_verifier_metrics()
             return
         try:
             with self.log_path.open("r", encoding="utf-8", errors="replace") as stream:
@@ -120,9 +132,11 @@ class AWMServerLogMirror:
                 content = stream.read(_MAX_READ_BYTES)
                 self._offset = stream.tell()
         except OSError:
+            self._flush_verifier_metrics()
             return
         for line in content.splitlines():
             self._handle_line(line)
+        self._flush_verifier_metrics()
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -134,6 +148,9 @@ class AWMServerLogMirror:
 
     def _handle_line(self, line: str) -> None:
         line = _redact(line)
+        if line.startswith(_VERIFIER_EVIDENCE_PREFIX):
+            self._handle_verifier_evidence(line[len(_VERIFIER_EVIDENCE_PREFIX) :])
+            return
         # The server cannot emit this project-only tag. It prevents accidental
         # self-feeding if a user redirects driver output into AWM_SERVER_LOG.
         if "noise_rl.awm_log_mirror" in line or "[AWM server diagnostic" in line:
@@ -147,6 +164,71 @@ class AWMServerLogMirror:
             self._emit(line)
             self._followups = self.followup_lines
         self.context.append(line)
+
+    def _handle_verifier_evidence(self, serialized: str) -> None:
+        """Turn compact server-side evidence markers into bounded SwanLab scalars."""
+        try:
+            event = json.loads(serialized)
+        except (TypeError, ValueError):
+            self.logger.warning("AWM verifier evidence marker was not valid JSON")
+            return
+        if not isinstance(event, dict):
+            self.logger.warning("AWM verifier evidence marker was not an object")
+            return
+        reward_type = str(event.get("reward_type", "unknown"))
+        evidence = event.get("evidence") if isinstance(event.get("evidence"), dict) else {}
+        status = str(evidence.get("status", "unknown"))
+        self._verifier_evidence["noncomplete_total"] += 1
+        self._verifier_evidence[f"reward_type/{reward_type}"] += 1
+        self._verifier_evidence[f"capture/{status}"] += 1
+        self._verifier_evidence["db_backups_saved_total"] += int(evidence.get("db_backups_saved", 0) or 0)
+        scenario, task_idx = event.get("scenario"), event.get("task_idx")
+        if scenario is not None and task_idx is not None:
+            self._verifier_tasks.add((str(scenario), str(task_idx)))
+        self._verifier_metrics_dirty = True
+        if status == "saved":
+            self.logger.warning(
+                "[AWM verifier evidence] scenario=%s task_idx=%s path=%s changed_tables=%s trajectory_entries=%s",
+                scenario,
+                task_idx,
+                evidence.get("path"),
+                evidence.get("changed_tables"),
+                evidence.get("trajectory_entries"),
+            )
+
+    def _flush_verifier_metrics(self, *, force: bool = False) -> None:
+        if not self._verifier_metrics_dirty:
+            return
+        interval = float(_environment_number("NOISE_RL_AWM_METRIC_FLUSH_SECONDS", _DEFAULT_METRIC_FLUSH_SECONDS))
+        if not force and monotonic() - self._last_verifier_metric < interval:
+            return
+        metrics = {
+            "awm/verifier/noncomplete/total": float(self._verifier_evidence["noncomplete_total"]),
+            "awm/verifier/noncomplete/unique_tasks": float(len(self._verifier_tasks)),
+            "awm/verifier/others/total": float(self._verifier_evidence["reward_type/others"]),
+            "awm/verifier/evidence/saved_total": float(self._verifier_evidence["capture/saved"]),
+            "awm/verifier/evidence/skipped_total": float(self._verifier_evidence["capture/skipped"]),
+            "awm/verifier/evidence/disabled_total": float(self._verifier_evidence["capture/disabled"]),
+            "awm/verifier/evidence/error_total": float(self._verifier_evidence["capture/error"]),
+            "awm/verifier/evidence/db_backups_saved_total": float(
+                self._verifier_evidence["db_backups_saved_total"]
+            ),
+        }
+        reporter = self._metric_reporter
+        if reporter is None:
+            try:
+                from .swanlab_bridge import report_metrics_nonblocking
+
+                reporter = report_metrics_nonblocking
+            except Exception:  # pragma: no cover - telemetry must never break rollout
+                reporter = None
+        if reporter is not None:
+            try:
+                reporter(metrics)
+            except Exception:  # pragma: no cover - telemetry must never break rollout
+                self.logger.exception("AWM verifier metrics could not be forwarded")
+        self._verifier_metrics_dirty = False
+        self._last_verifier_metric = monotonic()
 
     def _is_duplicate(self, line: str) -> bool:
         now = monotonic()

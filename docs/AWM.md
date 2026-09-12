@@ -71,12 +71,49 @@ bash scripts/train_awm_4gpu.sh
 日志回环；只在训练命令设置该变量不会为已经运行的前台服务器追溯生成日志。
 
 服务启动器还会在**不修改 OpenEnv 工作树文件**的前提下，使用项目的运行时入口包装 AWM。
-当生成 scenario 子进程的 MCP 工具返回 500、或 code verifier 返回非
-`complete`/`incomplete` 时，包装器会在 session 清理前读取该子进程 `server.log` 的末尾，连同
-scenario、task、工具参数、原始错误和 verifier 结果写进外层服务日志。因此它也会被上面的
-SwanLab 镜像捕获，并在 `${AWM_DIAGNOSTICS_DIR:-$RUNTIME_TMPDIR/awm-session-diagnostics}` 留下一个
-JSON 文件。默认每次保留末尾 24 KiB，可用 `NOISE_RL_AWM_SUBPROCESS_LOG_TAIL_BYTES` 调整，上限
-为 256 KiB。
+当生成 scenario 子进程的 MCP 工具返回 500 时，包装器会在 session 清理前读取该子进程
+`server.log` 的末尾，连同 scenario、task、工具参数、原始错误写进外层服务日志。因此它也会被
+上面的 SwanLab 镜像捕获，并在
+`${AWM_DIAGNOSTICS_DIR:-$RUNTIME_TMPDIR/awm-session-diagnostics}` 留下 JSON 文件。默认每次保留
+末尾 24 KiB，可用 `NOISE_RL_AWM_SUBPROCESS_LOG_TAIL_BYTES` 调整，上限为 256 KiB。
+
+### Code verifier `others` 证据包
+
+OpenEnv 的 **code** verifier 对未通过的判定返回 `others`（它不是 verifier 进程异常）。在未确认
+它是普通策略失败、环境 API 问题还是 verifier 条件错误前，不能仅依赖这一标签。每次 `others` 都会
+在外层日志写入一条紧凑的 `NOISE_RL_AWM_VERIFIER_EVIDENCE` 标记；训练端将其汇总到 SwanLab：
+此诊断机制**不改变**训练客户端对 `others` 的处理，也不会把它悄悄折算成零奖励；完成证据分析后再
+决定是否修改训练语义。
+
+- `awm/verifier/noncomplete/total`：code-verifier 未通过次数；不是总验证次数，不能直接当作失败率。
+- `awm/verifier/noncomplete/unique_tasks`：已观察到的不同 `(scenario, task_idx)` 数。
+- `awm/verifier/evidence/{saved,skipped,disabled,error}_total`：证据包落盘状态。
+- `awm/verifier/evidence/db_backups_saved_total`：已保存的 SQLite 快照数。
+
+为避免高并发训练时产生大量临时文件，默认仅保存最多 64 个 bundle，且每个任务最多一个。每个已保存
+bundle 目录为 `${AWM_DIAGNOSTICS_DIR}/awm-evidence-*/`，包含：
+
+- `evidence.json`：任务文本、code verifier 源码及 SHA-256、完整（有上限）MCP 调用轨迹、原始
+  verifier 返回、子环境日志尾部，以及 SQLite 表级初始/最终摘要与 diff；
+- `initial.sqlite`、`final.sqlite`：通过 SQLite backup API 保存的独立一致性快照（包含 WAL 状态）。
+
+先读 `evidence.json` 的 `database.diff` 和 `trajectory.entries`：任务状态已满足而 verifier 仍为
+`others` 时，优先检查 verifier/数据；工具调用返回 5xx 或未改变数据库时，检查环境；状态未满足且调用
+正常时，才属于普通策略失败。默认限制可按一次调试运行临时覆盖：
+
+```bash
+NOISE_RL_AWM_EVIDENCE_MAX_BUNDLES=100 \
+NOISE_RL_AWM_EVIDENCE_PER_TASK=1 \
+NOISE_RL_AWM_EVIDENCE_MAX_DB_BYTES=$((32 * 1024 * 1024)) \
+NOISE_RL_AWM_OTHERS_LOG_TAIL_BYTES=$((8 * 1024)) \
+bash scripts/start_awm_server.sh
+```
+
+将 `NOISE_RL_AWM_EVIDENCE_MAX_BUNDLES=0` 设为禁用落盘；计数仍会上报。单条轨迹与 verifier 源码的
+保留上限可用 `NOISE_RL_AWM_EVIDENCE_MAX_TRAJECTORY_ENTRIES`、
+`NOISE_RL_AWM_EVIDENCE_MAX_TRAJECTORY_BYTES`、`NOISE_RL_AWM_EVIDENCE_MAX_VERIFIER_BYTES` 调整。
+这些变量必须在启动 AWM 服务前设置；外部服务训练时也需将同一个 `AWM_SERVER_LOG` 传给训练脚本，
+才能看到 SwanLab 图表和证据路径。
 
 每条轨迹创建独立 WebSocket session；网络操作通过后台 asyncio loop 执行，环境接口通过现有有界线程池等待返回。AWM 不使用 ALFWorld 的进程池。`environment_workers` 控制同时进行的环境请求数量，`concurrency` 控制模型侧容量，服务器 session 上限必须覆盖全部活跃轨迹（包含正在等待模型的轨迹）。先以 32/64/128 活跃轨迹逐级压测，不能把最大连接数当作实际吞吐。
 

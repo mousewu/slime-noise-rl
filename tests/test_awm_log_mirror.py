@@ -1,3 +1,4 @@
+import json
 import logging
 
 from noise_rl.awm_log_mirror import AWMServerLogMirror
@@ -59,3 +60,45 @@ def test_awm_mirror_waits_for_server_log_and_ignores_benign_lines(tmp_path):
     mirror.poll_once()
 
     assert records.messages == []
+
+
+def test_awm_mirror_reports_compact_verifier_evidence_metrics(tmp_path):
+    server_log = tmp_path / "awm-server.log"
+    server_log.write_text(
+        "NOISE_RL_AWM_VERIFIER_EVIDENCE "
+        + json.dumps(
+            {
+                "kind": "code_verifier_noncomplete",
+                "scenario": "threading_demo",
+                "task_idx": 3,
+                "reward_type": "others",
+                "evidence": {
+                    "status": "saved",
+                    "path": "/tmp/evidence.json",
+                    "db_backups_saved": 2,
+                    "changed_tables": 1,
+                    "trajectory_entries": 7,
+                },
+            }
+        )
+        + "\n"
+    )
+    forwarded = []
+    logger, records = _logger("test.awm_log_mirror_verifier_metrics")
+    mirror = AWMServerLogMirror(server_log, logger=logger, metric_reporter=forwarded.append)
+
+    mirror.poll_once()
+    mirror.stop()
+
+    assert len(forwarded) == 1
+    assert forwarded[0] == {
+        "awm/verifier/noncomplete/total": 1.0,
+        "awm/verifier/noncomplete/unique_tasks": 1.0,
+        "awm/verifier/others/total": 1.0,
+        "awm/verifier/evidence/saved_total": 1.0,
+        "awm/verifier/evidence/skipped_total": 0.0,
+        "awm/verifier/evidence/disabled_total": 0.0,
+        "awm/verifier/evidence/error_total": 0.0,
+        "awm/verifier/evidence/db_backups_saved_total": 2.0,
+    }
+    assert any("scenario=threading_demo task_idx=3" in message for message in records.messages)

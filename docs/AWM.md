@@ -117,6 +117,30 @@ bash scripts/start_awm_server.sh
 
 每条轨迹创建独立 WebSocket session；网络操作通过后台 asyncio loop 执行，环境接口通过现有有界线程池等待返回。AWM 不使用 ALFWorld 的进程池。`environment_workers` 控制同时进行的环境请求数量，`concurrency` 控制模型侧容量，服务器 session 上限必须覆盖全部活跃轨迹（包含正在等待模型的轨迹）。先以 32/64/128 活跃轨迹逐级压测，不能把最大连接数当作实际吞吐。
 
+### 批量提取 verifier evidence（无需 jq）
+
+一次训练收集到多个 `others` 后，不应基于单条轨迹推断根因。使用项目内置的只读汇总脚本，将
+`${AWM_DIAGNOSTICS_DIR}` 下的 `awm-evidence-*/evidence.json` 分类并写入一个**新目录**：
+
+```bash
+cd /path/to/slime-noise-rl
+AWM_DIAGNOSTICS_DIR=/data/awm-tmp/awm-session-diagnostics \
+AWM_EVIDENCE_REPORT_DIR=runs/awm-evidence-report-$(date +%Y%m%d-%H%M%S) \
+bash scripts/summarize_awm_evidence.sh
+```
+
+它不需要 `jq`、OpenEnv 或 AWM server 依赖，也不会改动证据包或数据库。输出目录包含：
+
+- `REPORT.md`：按类别汇总以及每类最多 5 条代表样本；
+- `summary.json`：机器可读总计数、verifier 结果和无效 JSON 路径；
+- `samples.tsv`：便于 `column -ts $'\\t' samples.tsv | less -S` 浏览；
+- `samples.jsonl`：每条证据的任务、真实业务工具调用、数据库变更和分类。
+
+分类只陈述证据可直接支持的事实：`submitted_done_without_business_tool`、
+`business_tool_calls_without_database_change`、`database_changed_but_verifier_noncomplete` 和
+`tool_or_service_error`。最后一类之前必须先检查完整 bundle；第三类也不能直接等同于
+verifier bug，仍须将最终数据库状态逐项和任务、verifier 源码比对。
+
 ## 数据
 
 使用 `scripts/build_awm_manifest.sh` 从本地 AgentWorldModel-1K 的七个 JSONL

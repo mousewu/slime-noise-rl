@@ -21,6 +21,7 @@ noise-rl = "noise_rl.cli:main"
 noise-rl-sft-data = "noise_rl.sft_data:main"
 noise-rl-awm-manifest = "noise_rl.awm_manifest:main"
 noise-rl-awm-context = "noise_rl.awm_context:main"
+noise-rl-awm-evidence-report = "noise_rl.awm_evidence_report:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

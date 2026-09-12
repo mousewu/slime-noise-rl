@@ -36,6 +36,40 @@ bash scripts/train_awm_4gpu.sh
 `START_AWM_SERVER=1` 仍可作为便利模式：它调用独立服务脚本，因而仍须提供
 `AWM_SERVER_PYTHON_BIN`、`OPENENV_DIR` 和 `AWM_DATA_DIR`，且只会停止它自己启动的服务。
 
+### 服务端错误镜像到 SwanLab
+
+训练端和 AWM 服务端是不同进程，Uvicorn/MCP 的 traceback 不会自然出现在 Ray worker
+日志中。若训练脚本以 `START_AWM_SERVER=1` 启动服务，它会自动增量读取该服务的 log，仅将
+`ERROR`、HTTP 5xx、`Traceback` 及有限上下文转发到训练日志和 SwanLab Logs，并在
+`runs/.../awm_server_diagnostics.log` 留下可持久化的副本。
+
+若服务由单独终端预先启动（`START_AWM_SERVER=0`），训练命令必须显式给出该终端实际写入的
+日志文件，才能镜像。先以后台日志模式启动服务：
+
+```bash
+AWM_SERVER_PYTHON_BIN=/opt/conda/envs/awm-server/bin/python \
+OPENENV_DIR=/workspace/OpenEnv \
+AWM_DATA_DIR=/datasets/AgentWorldModel-1K \
+RUNTIME_TMPDIR=/data/awm-tmp \
+AWM_SERVER_BACKGROUND=1 \
+AWM_SERVER_LOG=/data/awm-tmp/awm-server-8899.log \
+bash scripts/start_awm_server.sh
+```
+
+再在训练命令中传入同一路径：
+
+```bash
+AWM_SERVER_LOG=/data/awm-tmp/awm-server-8899.log \
+START_AWM_SERVER=0 AWM_URL=http://127.0.0.1:8899 \
+bash scripts/train_awm_4gpu.sh
+```
+
+默认每秒读取一次，首次仅检查末尾 64 KiB，避免重传整个历史日志。可用
+`NOISE_RL_AWM_LOG_MIRROR=0` 禁用；或用 `NOISE_RL_AWM_LOG_POLL_SECONDS`、
+`NOISE_RL_AWM_LOG_CONTEXT_LINES`、`NOISE_RL_AWM_LOG_FOLLOWUP_LINES` 调整诊断开销。
+`AWM_SERVER_LOG` 应为服务器的专用输出文件，不能重定向为训练进程的 stdout/stderr，以免造成
+日志回环；只在训练命令设置该变量不会为已经运行的前台服务器追溯生成日志。
+
 每条轨迹创建独立 WebSocket session；网络操作通过后台 asyncio loop 执行，环境接口通过现有有界线程池等待返回。AWM 不使用 ALFWorld 的进程池。`environment_workers` 控制同时进行的环境请求数量，`concurrency` 控制模型侧容量，服务器 session 上限必须覆盖全部活跃轨迹（包含正在等待模型的轨迹）。先以 32/64/128 活跃轨迹逐级压测，不能把最大连接数当作实际吞吐。
 
 ## 数据

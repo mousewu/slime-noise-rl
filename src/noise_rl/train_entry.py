@@ -45,6 +45,7 @@ def ray_temp_directory() -> str | None:
 def main(entrypoint: str = "train.py"):
     import ray
 
+    from .awm_log_mirror import start_awm_server_log_mirror
     from .ray_log_mirror import start_ray_log_mirror
     from .rollout_diagnostics import install_slime_timer_patch
     from .swanlab_bridge import (
@@ -130,6 +131,7 @@ def main(entrypoint: str = "train.py"):
         )
         ray_log_mirror = None
     swanlab_logger = None
+    awm_log_mirror = None
     try:
         if swanlab_settings:
             logger_type = ray.remote(num_cpus=0)(SwanLabLogger)
@@ -137,12 +139,20 @@ def main(entrypoint: str = "train.py"):
             ray.get(swanlab_logger.ready.remote())
             install_slime_logging_patch()
             install_log_mirror()
+        awm_log_mirror = start_awm_server_log_mirror(
+            audit_path=os.environ.get("NOISE_RL_AWM_DIAGNOSTICS_PATH")
+        )
         runpy.run_path(str(script), run_name="__main__")
     finally:
         training_failed = sys.exc_info()[0] is not None
         try:
             if ray_log_mirror is not None:
                 ray_log_mirror.poll_once()
+            if awm_log_mirror is not None:
+                # Read errors flushed by Uvicorn immediately before the driver
+                # exits, while the SwanLab owner still accepts forwarded logs.
+                awm_log_mirror.poll_once()
+                awm_log_mirror.stop()
             # Explicit finish means "Completed" in SwanLab. On an exception,
             # leave the run unfinished so the service can classify it as an
             # interrupted/crashed experiment instead of a successful one.

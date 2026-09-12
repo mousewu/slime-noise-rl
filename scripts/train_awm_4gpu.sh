@@ -165,6 +165,7 @@ print(f"Validated {len(records)} AWM training tasks")
 PY
 
 TASK_SERVER_PID=""
+TASK_AWM_MIRROR_LOG=""
 cleanup_awm_server() {
   if [[ -n "${TASK_SERVER_PID}" ]] && kill -0 "${TASK_SERVER_PID}" 2>/dev/null; then
     kill "${TASK_SERVER_PID}"
@@ -185,8 +186,15 @@ if [[ "${TASK_START_SERVER}" == 1 ]]; then
   AWM_PORT="${TASK_AWM_PORT}" \
   bash "${TASK_AWM_SERVER_SCRIPT}"
   TASK_SERVER_PID="$(<"${TASK_SERVER_PID_FILE}")"
+  TASK_AWM_MIRROR_LOG="${TASK_SERVER_LOG}"
 else
   echo "[4/6] Using the existing AWM server at ${TASK_AWM_URL}"
+  # An independently launched server has no discoverable stdout path. The
+  # caller supplies AWM_SERVER_LOG when it wants its diagnostics in SwanLab.
+  TASK_AWM_MIRROR_LOG="${AWM_SERVER_LOG:-}"
+  if [[ -z "${TASK_AWM_MIRROR_LOG}" ]]; then
+    echo "AWM server-log mirroring is unavailable for an external server; set AWM_SERVER_LOG to its file"
+  fi
 fi
 
 "${TASK_PYTHON_BIN}" - "${TASK_AWM_URL}" "${TASK_SERVER_PID}" "${TASK_SERVER_LOG}" <<'PY'
@@ -215,6 +223,12 @@ for _ in range(180):
 else:
     raise RuntimeError(f"AWM server did not become ready: {error}; inspect {log}")
 PY
+
+if [[ -n "${TASK_AWM_MIRROR_LOG}" ]]; then
+  export NOISE_RL_AWM_SERVER_LOG="${TASK_AWM_MIRROR_LOG}"
+  export NOISE_RL_AWM_DIAGNOSTICS_PATH="${NOISE_RL_AWM_DIAGNOSTICS_PATH:-${TASK_OUTPUT}/awm_server_diagnostics.log}"
+  echo "AWM server diagnostics will be mirrored to SwanLab from ${TASK_AWM_MIRROR_LOG}"
+fi
 
 TASK_TRAIN_ARGS=(
   --config "${TASK_CONFIG}"

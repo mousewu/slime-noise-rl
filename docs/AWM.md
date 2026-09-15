@@ -184,6 +184,49 @@ bash scripts/build_awm_manifest.sh
 `AWM_VALID_SCENARIO_FRACTION`，并把生成的 `split-report.json` 与论文实验记录一同保存。
 报告会列出被排除的无 pure-code verifier 任务；脚本拒绝覆盖已有输出，以免意外改变数据划分。
 
+### 训练前工具可用性审计（建议必做）
+
+`reset -> list_tools -> done` 只能说明一个 AWM scenario 能启动，不能说明每一个业务工具都能
+调用。生成的 FastAPI 代码可能把后注册的静态路径（例如 `/pins/search`）放在先注册的动态路径
+（例如 `/pins/{pin_id}`）之后；这种情况只有实际调用对应 MCP 工具时才会暴露为 HTTP 422。
+
+在**已运行的 AWM 服务端 Python 环境**中，运行下列审计。它只对静态检测到有路由遮蔽风险的
+业务工具调用一次，参数从工具公开 JSON schema 构造；每条 JSONL 都保存直接诊断序列
+`reset -> list_tools -> call_tool -> done`，不是模型 rollout。每个 session 结束会清理其临时
+SQLite 数据库，因此不会改动原始数据集或后续训练任务。
+
+```bash
+AWM_SERVER_PYTHON_BIN=/opt/conda/envs/awm-server/bin/python \
+AWM_DATA_DIR=/datasets/AgentWorldModel-1K \
+AWM_URL=http://127.0.0.1:8899 \
+AWM_TOOL_AUDIT_OUTPUT=runs/awm-tool-audit-$(date +%Y%m%d-%H%M%S).jsonl \
+AWM_TOOL_AUDIT_WORKERS=4 \
+bash scripts/audit_awm_tools.sh
+```
+
+该审计只将三类结果标记为可自动排除：实际响应明确包含 `HTTP 422`、明确包含 `HTTP 500`，或目标
+工具不在 MCP 清单中/其公开 schema 不能构造参数。其他业务级 4xx、语义错误和未分类
+`server_error` 仍写入证据，但不会被错误地宣称为环境缺陷。路由审计是针对这类结构性问题的高覆盖
+检查；它不替代带真实任务语义和前置工具调用的端到端 500 排查。脚本默认还会枚举全部 1,000 个
+scenario 的工具 schema（不调用业务工具），在 summary 的 `schema_all` 中记录可/不可构造的数量；若
+只想调试路由调用，可设 `AWM_TOOL_AUDIT_SCHEMA_ALL=0`。
+
+随后按**完整 scenario** 过滤训练 manifest，而不是仅从工具列表删除一个工具：后者会留下依赖该
+工具、却已不可能完成的任务，向 RL 引入人为零奖励。输出与报告均为新文件，不会覆盖原 manifest：
+
+```bash
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+AWM_MANIFEST=data/awm/train.jsonl \
+AWM_TOOL_AUDIT_OUTPUT=runs/awm-tool-audit-YYYYMMDD-HHMMSS.jsonl \
+AWM_FILTERED_MANIFEST=data/awm/train.tool-filtered.jsonl \
+AWM_FILTER_REPORT=data/awm/train.tool-filtered.report.json \
+bash scripts/filter_awm_manifest.sh
+```
+
+接着将 `AWM_MANIFEST` 指向 `train.tool-filtered.jsonl` 再做初始上下文审计。若要报告“功能可用子集”
+上的验证分数，应对 `valid_unseen.jsonl` 用同一审计结果再过滤一次，并同时保留原始验证集分数与
+过滤后的 scenario/任务数量；不要把两个口径混为同一个结果。
+
 ### 初始上下文审计（必做）
 
 AWM 的初始 observation 包含任务和完整工具 schema，其 token 数不能只从原始 JSONL

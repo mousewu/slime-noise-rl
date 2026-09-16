@@ -40,7 +40,7 @@ def options(tmp_path):
     )
 
 
-def test_verify_slime_requires_only_the_requested_local_entrypoint(tmp_path):
+def test_verify_slime_accepts_any_clean_commit_and_records_head(tmp_path):
     slime = tmp_path / "slime"
     slime.mkdir()
     subprocess.run(["git", "init", "-b", "main"], cwd=slime, check=True, capture_output=True)
@@ -61,12 +61,12 @@ def test_verify_slime_requires_only_the_requested_local_entrypoint(tmp_path):
         check=True,
         capture_output=True,
     )
-    assert verify_slime(slime) == "unverified-local"
+    expected = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=slime, text=True).strip()
+    assert verify_slime(slime) == expected
 
-    # A user-managed Slime checkout may intentionally have local patches.
-    # This project must not inspect its commit or tracked-file state.
     (slime / "train.py").write_text("print('modified')\n", encoding="utf-8")
-    assert verify_slime(slime) == "unverified-local"
+    with pytest.raises(ValueError, match="modified"):
+        verify_slime(slime)
 
 
 def test_configure_megatron_lm_path_prepends_source_tree(tmp_path, monkeypatch):

@@ -53,18 +53,17 @@ def swanlab_runtime_config(tracking: dict, experiment: dict) -> dict:
 
 
 def verify_slime(slime_dir, entrypoint="train.py"):
-    """Confirm only that the requested local Slime entrypoint is present.
-
-    Slime is a user-managed local dependency.  Its Git commit and tracked-file
-    state must not block a training run: users may carry local compatibility
-    patches, and this project deliberately does not modify that checkout.
-    The stable marker preserves the existing run-metadata schema while making
-    the absence of a provenance check explicit.
-    """
     slime_dir = Path(slime_dir).expanduser().resolve(strict=True)
     if not (slime_dir / entrypoint).is_file():
         raise FileNotFoundError(f"Slime {entrypoint} was not found in {slime_dir}")
-    return "unverified-local"
+    actual = subprocess.check_output(["git", "-C", str(slime_dir), "rev-parse", "HEAD"], text=True).strip()
+    # Untracked files are allowed; modified tracked source is not a verified dependency.
+    dirty = subprocess.check_output(
+        ["git", "-C", str(slime_dir), "status", "--porcelain", "--untracked-files=no"], text=True
+    ).strip()
+    if dirty:
+        raise ValueError("Slime tracked source is modified; use a clean checkout")
+    return actual
 
 
 def configure_megatron_lm_path():

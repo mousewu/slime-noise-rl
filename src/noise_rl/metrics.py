@@ -215,6 +215,8 @@ def _awm_trace_metrics(records: list[dict], *, prefix: str) -> dict[str, int | f
         return {}
     done_submissions = done_first = final_answers = input_validation_errors = 0
     verifier_outcomes: Counter[str] = Counter()
+    terminal_failures: Counter[str] = Counter()
+    terminal_failure_tasks: set[str] = set()
     for record in awm_records:
         actions = [_awm_action(step) for step in record.get("steps", [])]
         actions = [action for action in actions if action is not None]
@@ -236,6 +238,12 @@ def _awm_trace_metrics(records: list[dict], *, prefix: str) -> dict[str, int | f
             outcome = awm_info.get("verifier_reward_type")
             if isinstance(outcome, str):
                 verifier_outcomes[outcome] += 1
+            failure_type = awm_info.get("tool_terminal_failure_type")
+            if isinstance(failure_type, str):
+                terminal_failures[failure_type] += 1
+                task_id = record.get("plan", {}).get("task_id")
+                if isinstance(task_id, str):
+                    terminal_failure_tasks.add(task_id)
     episode_count = len(awm_records)
     result: dict[str, int | float] = {
         f"{prefix}/awm/episodes": episode_count,
@@ -248,9 +256,16 @@ def _awm_trace_metrics(records: list[dict], *, prefix: str) -> dict[str, int | f
             final_answers / done_submissions if done_submissions else 0.0
         ),
         f"{prefix}/awm/tool_input_validation_errors/total": input_validation_errors,
+        # A business-tool server failure closes only this trajectory.  These
+        # counters distinguish that deliberate zero-reward terminal path from
+        # normal verifier failures and from a fully-async worker crash.
+        f"{prefix}/awm/tool_terminal_failures/total": sum(terminal_failures.values()),
+        f"{prefix}/awm/tool_terminal_failures/unique_tasks": len(terminal_failure_tasks),
     }
     for outcome, value in verifier_outcomes.items():
         result[f"{prefix}/awm/verifier/{outcome}_rate"] = value / episode_count
+    for failure_type, value in terminal_failures.items():
+        result[f"{prefix}/awm/tool_terminal_failures/{failure_type}/total"] = value
     return result
 
 

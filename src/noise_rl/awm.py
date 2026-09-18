@@ -20,6 +20,15 @@ Finish with {"tool_name":"done","arguments":{}}. For a requested returned or rep
 _LOOP = None
 _LOCK = Lock()
 
+# These are returned by OpenEnv *after* a syntactically valid action reached a
+# scenario subprocess.  A failed business-tool call can have an ambiguous
+# database effect, so continuing the same episode would make its reward hard
+# to interpret.  It must nevertheless be a completed zero-reward trajectory,
+# not an exception that makes Slime discard/requeue the whole async group.
+# Reset, discovery, and verifier failures remain fail-closed below because no
+# valid environment episode has then been established.
+_TOOL_TERMINAL_FAILURES = {"server_error", "timeout", "no_verifier", "judge_error"}
+
 
 def canonical_action(text):
     value = json.loads(text)
@@ -250,6 +259,25 @@ class AWMEnvironment:
         if name not in self.tools:
             return StepResult("FORMAT_ERROR: unknown or reserved tool")
         result = await self.client.call_tool(name, arguments)
+        obs = _observation(result)
+        failure_type = _field(obs, "reward_type")
+        if failure_type in _TOOL_TERMINAL_FAILURES:
+            error = str(_field(obs, "error", "") or "")
+            return StepResult(
+                f"ENVIRONMENT_ERROR: {failure_type}: {error}".rstrip(),
+                terminated=True,
+                info={
+                    "awm": {
+                        "tool_terminal_failure": True,
+                        "tool_terminal_failure_type": failure_type,
+                        "tool_terminal_failure_tool": name,
+                        "tool_terminal_failure_error": error,
+                    }
+                },
+            )
+        # Keep the reset/discovery/verifier fail-closed policy for unexpected
+        # protocol states.  Only an executed business-tool failure follows the
+        # completed-zero-reward path above.
         obs = self._check(result)
         return StepResult(
             json.dumps({"result": _field(obs, "tool_result"), "error": _field(obs, "error")}, ensure_ascii=False)

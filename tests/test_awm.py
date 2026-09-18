@@ -131,6 +131,43 @@ def test_awm_others_is_a_normal_zero_reward_terminal_result():
         env.close()
 
 
+def test_awm_business_tool_server_error_is_one_zero_reward_terminal_episode():
+    class Client:
+        async def reset(self, **kwargs):
+            return {"observation": {"reward_type": "reset_ok", "has_verifier": {"code": True}, "task": "Write"}}
+
+        async def list_tools(self):
+            return {"observation": {"tools": [{"name": "create", "input_schema": {}}]}}
+
+        async def call_tool(self, tool_name, arguments):
+            assert (tool_name, arguments) == ("create", {"name": "duplicate"})
+            return {
+                "observation": {
+                    "reward_type": "server_error",
+                    "tool_name": "create",
+                    "error": "Error calling create. Status code: 500.",
+                }
+            }
+
+        async def close(self):
+            pass
+
+    env = AWMEnvironment({"scenario": "test", "task_idx": 0}, "http://localhost:8899", client_factory=lambda **_: Client())
+    try:
+        env.reset()
+        result = env.step(canonical_action('{"tool_name":"create","arguments":{"name":"duplicate"}}'))
+        assert result.terminated and not result.success and not result.truncated
+        assert result.observation.startswith("ENVIRONMENT_ERROR: server_error")
+        assert result.info["awm"] == {
+            "tool_terminal_failure": True,
+            "tool_terminal_failure_type": "server_error",
+            "tool_terminal_failure_tool": "create",
+            "tool_terminal_failure_error": "Error calling create. Status code: 500.",
+        }
+    finally:
+        env.close()
+
+
 @pytest.mark.parametrize(
     "action",
     [

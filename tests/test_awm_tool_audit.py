@@ -91,3 +91,40 @@ def test_filter_removes_entire_scenario_for_confirmed_tool_failure(tmp_path):
     assert result["scenarios_identified_in_audit"] == result["scenarios_removed"] == 1
     assert [row["metadata"]["task"]["scenario"] for row in read_records(output)] == ["healthy"]
     assert json.loads(report.read_text(encoding="utf-8"))["status_counts"] == {"confirmed_http_422": 1}
+
+
+def test_filter_removes_only_task_for_task_scoped_incident_replay(tmp_path):
+    manifest = tmp_path / "train.jsonl"
+    _write_jsonl(manifest, [_record("shared", 0), _record("shared", 1), _record("healthy", 0)])
+    audit = tmp_path / "incident-replay.jsonl"
+    _write_jsonl(
+        audit,
+        [
+            {
+                "scenario": "shared",
+                "task_idx": 1,
+                "status": "confirmed_http_500",
+                "excluded_from_training": True,
+                "exclusion_scope": "task",
+            },
+            {
+                "scenario": "shared",
+                "task_idx": 0,
+                "status": "confirmed_http_500",
+                "excluded_from_training": False,
+                "exclusion_scope": "task",
+            },
+        ],
+    )
+    output = tmp_path / "filtered.jsonl"
+    report = tmp_path / "filtered.report.json"
+
+    result = filter_manifest(manifest=manifest, audit=audit, output=output, report=report)
+
+    assert result["tasks_kept"] == 2
+    assert result["tasks_removed"] == 1
+    assert result["tasks_identified_in_audit"] == 1
+    assert [(row["metadata"]["task"]["scenario"], row["metadata"]["task"]["task_idx"]) for row in read_records(output)] == [
+        ("shared", 0),
+        ("healthy", 0),
+    ]

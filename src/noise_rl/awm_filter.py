@@ -1,4 +1,4 @@
-"""Exclude AWM scenarios with confirmed broken tools from a manifest."""
+"""Exclude only AWM samples supported by explicit preflight evidence."""
 
 from __future__ import annotations
 
@@ -17,6 +17,21 @@ EXCLUSION_STATUSES = {
     "target_tool_not_discoverable",
     "unconstructible_parameters",
 }
+
+
+def _audit_scope(row: dict[str, Any]) -> str:
+    """Return a conservative, backward-compatible exclusion scope.
+
+    Older route-shadow audits predate task-level incident replay and establish
+    that a scenario-level public tool is structurally unavailable.  Preserve
+    their scenario scope when no explicit scope is present.  New incident
+    replays must declare ``task`` and can therefore remove only the affected
+    ``scenario/task_idx`` pair.
+    """
+    scope = row.get("exclusion_scope", "scenario")
+    if scope not in {"scenario", "task"}:
+        raise ValueError(f"Invalid audit exclusion_scope: {scope!r}")
+    return str(scope)
 
 
 def _read_audit(path: Path) -> list[dict[str, Any]]:
@@ -40,13 +55,26 @@ def _read_audit(path: Path) -> list[dict[str, Any]]:
 def filter_manifest(*, manifest: Path, audit: Path, output: Path, report: Path) -> dict[str, Any]:
     records = read_records(manifest)
     audit_rows = _read_audit(audit)
-    reasons: dict[str, set[str]] = defaultdict(set)
+    scenario_reasons: dict[str, set[str]] = defaultdict(set)
+    task_reasons: dict[tuple[str, int], set[str]] = defaultdict(set)
     for row in audit_rows:
         scenario = row.get("scenario")
         status = row.get("status")
-        if isinstance(scenario, str) and status in EXCLUSION_STATUSES:
-            reasons[scenario].add(str(status))
-    if not reasons:
+        if not isinstance(scenario, str) or status not in EXCLUSION_STATUSES:
+            continue
+        if not row.get("excluded_from_training", True):
+            continue
+        scope = _audit_scope(row)
+        if scope == "scenario":
+            scenario_reasons[scenario].add(str(status))
+            continue
+        task_idx = row.get("task_idx")
+        if not isinstance(task_idx, int) or task_idx < 0:
+            raise ValueError(
+                f"Task-scoped exclusion for {scenario!r} requires a nonnegative integer task_idx"
+            )
+        task_reasons[(scenario, task_idx)].add(str(status))
+    if not scenario_reasons and not task_reasons:
         raise ValueError(
             "Audit contains no confirmed 422/500 or parameter-construction failures; refusing to create a misleading filtered manifest"
         )
@@ -55,15 +83,15 @@ def filter_manifest(*, manifest: Path, audit: Path, output: Path, report: Path) 
         task = record["metadata"]["task"]
         if task["environment"] != "awm":
             raise ValueError("AWM tool filtering accepts an AWM-only manifest")
-        scenario = task["scenario"]
-        if scenario in reasons:
-            removed.append({"id": task["id"], "scenario": scenario, "task_idx": task["task_idx"], "reasons": sorted(reasons[scenario])})
+        scenario, task_idx = task["scenario"], task["task_idx"]
+        reasons = set(scenario_reasons.get(scenario, set()))
+        reasons.update(task_reasons.get((scenario, task_idx), set()))
+        if reasons:
+            removed.append({"id": task["id"], "scenario": scenario, "task_idx": task_idx, "reasons": sorted(reasons)})
         else:
             kept.append(record)
     if not kept:
         raise ValueError("Filtering would remove every training task; no output was written")
-    removed_scenarios = {row["scenario"] for row in removed}
-    effective_reasons = {scenario: reasons[scenario] for scenario in removed_scenarios}
     write_records(output, kept)
     result = {
         "input_manifest": str(manifest),
@@ -72,13 +100,20 @@ def filter_manifest(*, manifest: Path, audit: Path, output: Path, report: Path) 
         "tasks_input": len(records),
         "tasks_kept": len(kept),
         "tasks_removed": len(removed),
-        "scenarios_identified_in_audit": len(reasons),
-        "scenarios_removed": len(effective_reasons),
+        "scenarios_identified_in_audit": len(scenario_reasons),
+        "tasks_identified_in_audit": len(task_reasons),
+        "scenarios_removed": len({row["scenario"] for row in removed}),
         "status_counts": dict(
-            sorted(Counter(reason for values in effective_reasons.values() for reason in values).items())
+            sorted(
+                Counter(
+                    reason
+                    for values in [*scenario_reasons.values(), *task_reasons.values()]
+                    for reason in values
+                ).items()
+            )
         ),
         "removed": removed,
-        "policy": "exclude every task in a scenario with a confirmed HTTP 422/500, unavailable target tool, or unconstructible tool schema; removing only the tool would leave tasks that require it impossible",
+        "policy": "scenario-scoped structural audit findings remove every task in that scenario; task-scoped incident replays remove only the exact scenario/task_idx. Rows explicitly marked excluded_from_training=false are retained as runtime-harness evidence.",
     }
     if report.exists():
         raise FileExistsError(f"Refusing to overwrite existing report: {report}")
@@ -100,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
         output=args.output.expanduser(),
         report=args.report.expanduser(),
     )
-    print(json.dumps({key: result[key] for key in ("tasks_input", "tasks_kept", "tasks_removed", "scenarios_removed", "output_manifest", "report") if key in result}, ensure_ascii=False, sort_keys=True))
+    print(json.dumps({key: result[key] for key in ("tasks_input", "tasks_kept", "tasks_removed", "scenarios_removed", "tasks_identified_in_audit", "output_manifest", "report") if key in result}, ensure_ascii=False, sort_keys=True))
     return 0
 
 

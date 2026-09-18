@@ -147,7 +147,12 @@ def test_trace_metrics_include_awm_submission_and_schema_grounding_signals():
                 {
                     "action": '{"arguments":{"value":null},"tool_name":"create"}',
                     "observation": "Input validation error: value must be an integer",
-                    "environment_info": {},
+                    "environment_info": {
+                        "awm": {
+                            "tool_terminal_failure_type": "server_error",
+                            "tool_terminal_failure_tool": "create",
+                        }
+                    },
                 },
                 {
                     "action": '{"arguments":{},"tool_name":"done"}',
@@ -162,6 +167,9 @@ def test_trace_metrics_include_awm_submission_and_schema_grounding_signals():
     assert metrics["rollout/awm/done_first_rate"] == 0.5
     assert metrics["rollout/awm/final_answer_submitted_rate"] == 0.5
     assert metrics["rollout/awm/tool_input_validation_errors/total"] == 1
+    assert metrics["rollout/awm/tool_terminal_failures/total"] == 1
+    assert metrics["rollout/awm/tool_terminal_failures/unique_tasks"] == 1
+    assert metrics["rollout/awm/tool_terminal_failures/server_error/total"] == 1
     assert metrics["rollout/awm/verifier/others_rate"] == 0.5
     assert metrics["rollout/awm/verifier/complete_rate"] == 0.5
 

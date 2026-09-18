@@ -211,8 +211,8 @@ bash scripts/audit_awm_tools.sh
 scenario 的工具 schema（不调用业务工具），在 summary 的 `schema_all` 中记录可/不可构造的数量；若
 只想调试路由调用，可设 `AWM_TOOL_AUDIT_SCHEMA_ALL=0`。
 
-随后按**完整 scenario** 过滤训练 manifest，而不是仅从工具列表删除一个工具：后者会留下依赖该
-工具、却已不可能完成的任务，向 RL 引入人为零奖励。输出与报告均为新文件，不会覆盖原 manifest：
+路由遮蔽这类结构性问题仍可按**完整 scenario** 过滤；但训练日志中复现的业务工具失败必须按
+`scenario + task_idx` 过滤，不能因为一个任务或一次错误动作删除同一 scenario 的十个任务。输出与报告均为新文件，不会覆盖原 manifest：
 
 ```bash
 PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
@@ -226,6 +226,35 @@ bash scripts/filter_awm_manifest.sh
 接着将 `AWM_MANIFEST` 指向 `train.tool-filtered.jsonl` 再做初始上下文审计。若要报告“功能可用子集”
 上的验证分数，应对 `valid_unseen.jsonl` 用同一审计结果再过滤一次，并同时保留原始验证集分数与
 过滤后的 scenario/任务数量；不要把两个口径混为同一个结果。
+
+### 已观察工具失败的任务级重放（必做）
+
+训练服务会在 `${AWM_DIAGNOSTICS_DIR}` 写入 `awm-diagnostic-*.json`，其中包含实际触发
+5xx 的工具名和参数。下一次训练前，使用一个**新 session/新数据库**重放这些动作；只有仍稳定
+失败且经人工确认该动作是任务必需步骤的记录，才会排除精确的 `scenario/task_idx`。项目内置
+`configs/awm_reviewed_task_incidents.jsonl` 包含当前已审核的两条任务/数据库矛盾，以及一条不应
+过滤、只用于验证 runtime 防护的策略错误动作。
+
+```bash
+AWM_SERVER_PYTHON_BIN=/opt/conda/envs/awm-server/bin/python \
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+AWM_URL=http://127.0.0.1:8899 \
+AWM_MANIFEST=data/awm/train.tool-filtered.jsonl \
+AWM_INCIDENTS=configs/awm_reviewed_task_incidents.jsonl \
+AWM_INCIDENT_REPLAY_OUTPUT=runs/awm-incident-replay-$(date +%Y%m%d-%H%M%S).jsonl \
+AWM_PREFLIGHT_MANIFEST=data/awm/train.task-preflight.jsonl \
+AWM_PREFLIGHT_REPORT=data/awm/train.task-preflight.report.json \
+bash scripts/preflight_awm_tasks.sh
+```
+
+对后续训练日志，直接把 `AWM_INCIDENTS` 指向 `${AWM_DIAGNOSTICS_DIR}` 即可。该脚本只接纳
+`tool_server_error` 诊断；未标记 `required_for_task: true` 的记录即使稳定重现 500 也不会修改
+manifest。它们会保留为 harness 鲁棒性证据，避免把策略错误伪装成“无解任务”。
+
+训练端对于已经执行的工具调用返回 `server_error` / `timeout` 时，现在会安全终止**该条** episode，
+奖励为零，并保留其生成 token；不会抛出异常导致 fully-async 丢弃或重排整个 comparison group。
+由于工具调用是否部分写入数据库不可判定，episode 不会在同一数据库上继续执行。SwanLab 中以
+`rollout/awm/tool_terminal_failures/*` 观察这类事件；该值应在预检后的正式训练中接近零。
 
 ### 初始上下文审计（必做）
 

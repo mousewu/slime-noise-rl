@@ -256,6 +256,59 @@ manifest。它们会保留为 harness 鲁棒性证据，避免把策略错误伪
 由于工具调用是否部分写入数据库不可判定，episode 不会在同一数据库上继续执行。SwanLab 中以
 `rollout/awm/tool_terminal_failures/*` 观察这类事件；该值应在预检后的正式训练中接近零。
 
+### 用固定 Qwen 策略全量发现任务级候选异常（不训练）
+
+现有 `preflight_awm_tasks.sh` 只重放**已经记录**的异常。如果要从全部训练任务中主动找出新的
+任务级 422/500，可让固定的 Qwen3-4B policy 通过与训练相同的 harness 完成一次端到端尝试。每个
+`task × repeat` 都会得到新建的 AWM session/SQLite 数据库；脚本关闭 action-drop 和 observation-loss，
+不启动 Slime/Ray、不反向传播、不更新模型，也不下载模型或数据。
+
+它复用一个已经单独运行的 SGLang 服务。不要连接正在进行 RL 的 rollout SGLang：后者会随 actor
+更新权重，且可能在训练结束后自动退出。服务上的模型必须和 `HF_CHECKPOINT` 的本地 tokenizer 一致。
+建议先以 32 题试跑，再以一个或多个稳定分片完成全量回放：
+
+```bash
+# 先验证服务、模型和 AWM harness；不训练。
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507 \
+AWM_URL=http://127.0.0.1:8899 \
+SGLANG_URL=http://127.0.0.1:30000 \
+AWM_MANIFEST=data/awm/train.task-preflight.ctx16k.jsonl \
+AWM_MODEL_REPLAY_TASKS=32 \
+AWM_MODEL_REPLAY_OUTPUT=runs/awm-model-replay-pilot.jsonl \
+bash scripts/replay_awm_tasks_with_model.sh
+
+# 全量：0 表示所选分片内全部任务；默认每题一次、最多 8 条并发轨迹。
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507 \
+AWM_URL=http://127.0.0.1:8899 \
+SGLANG_URL=http://127.0.0.1:30000 \
+AWM_MANIFEST=data/awm/train.task-preflight.ctx16k.jsonl \
+AWM_MODEL_REPLAY_TASKS=0 \
+AWM_MODEL_REPLAY_REPEATS=1 \
+AWM_MODEL_REPLAY_CONCURRENCY=8 \
+AWM_MODEL_REPLAY_OUTPUT=runs/awm-model-replay-full.jsonl \
+bash scripts/replay_awm_tasks_with_model.sh
+```
+
+输出有三份：完整多轮轨迹 `*.jsonl`、汇总 `*.jsonl.summary.json` 和候选异常
+`*.incidents.jsonl`。候选中一律为 `required_for_task: false`，不会自动过滤训练数据：模型可能只是重复
+创建已存在对象或漏掉前置步骤。只有审阅完整轨迹、确认故障动作是完成该题的必要步骤后，才将该行复制到
+已审核 incidents 文件并改为 `required_for_task: true`，再交给 `preflight_awm_tasks.sh` 重放和过滤。
+
+全量任务较多时可按稳定哈希切成互不重叠的分片，例如将以下两个作业并行执行；每个分片必须使用不同输出
+路径，完成后合并 JSONL 供分析，而不是让多个进程写同一个文件：
+
+```bash
+AWM_MODEL_REPLAY_SHARD_COUNT=2 AWM_MODEL_REPLAY_SHARD_INDEX=0 \
+AWM_MODEL_REPLAY_OUTPUT=runs/awm-model-replay-shard0.jsonl \
+bash scripts/replay_awm_tasks_with_model.sh
+
+AWM_MODEL_REPLAY_SHARD_COUNT=2 AWM_MODEL_REPLAY_SHARD_INDEX=1 \
+AWM_MODEL_REPLAY_OUTPUT=runs/awm-model-replay-shard1.jsonl \
+bash scripts/replay_awm_tasks_with_model.sh
+```
+
 ### 初始上下文审计（必做）
 
 AWM 的初始 observation 包含任务和完整工具 schema，其 token 数不能只从原始 JSONL

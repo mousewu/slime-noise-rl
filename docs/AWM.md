@@ -325,6 +325,23 @@ MAX_CONTEXT_TOKENS=16384 \
 bash scripts/audit_awm_context.sh
 ```
 
+The audit prints its launch configuration, an aggregate progress record every
+100 tasks, and a structured record for every failed task.  This lets an
+operator distinguish a reset, tool-discovery, or local-tokenizer failure
+without printing the full prompt or tool schemas.  For a focused diagnosis,
+use a single AWM request at a time and print token counts for every successful
+task:
+
+```bash
+CONCURRENCY=1 \
+AWM_CONTEXT_PROGRESS_EVERY=1 \
+AWM_CONTEXT_VERBOSE=1 \
+bash scripts/audit_awm_context.sh
+```
+
+`AWM_CONTEXT_VERBOSE=1` is intentionally noisy on the full dataset; leave it
+at its default (`0`) for a normal audit.
+
 该工具使用 rollout 相同的 WebSocket reset、code-verifier 检查、保留工具列表、AWM
 system prompt 和 Qwen chat template。它保留满足严格条件
 `initial_prompt_tokens < MAX_CONTEXT_TOKENS` 的原始 manifest 行，并将所有排除任务及

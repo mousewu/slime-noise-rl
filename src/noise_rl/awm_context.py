@@ -12,8 +12,11 @@ import asyncio
 import hashlib
 import json
 import os
+import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any, Callable
 
 from .agent import QwenChatProtocol
 from .awm import AWMEnvironment, SYSTEM_PROMPT
@@ -26,7 +29,20 @@ class ContextInspection:
     scenario: str
     task_idx: int
     prompt_tokens: int | None
+    stage: str = "complete"
     error: str | None = None
+
+
+def _emit(event: dict[str, Any], reporter: Callable[[dict[str, Any]], None] | None) -> None:
+    """Send a compact, structured audit diagnostic without logging prompts/tools."""
+    if reporter is not None:
+        reporter(event)
+        return
+    print(
+        "[AWM context audit] " + json.dumps(event, ensure_ascii=False, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def load_local_tokenizer(model: str | Path):
@@ -65,12 +81,80 @@ async def inspect_awm_contexts(
     timeout: float,
     concurrency: int,
     observation_fetcher=None,
+    progress_every: int = 100,
+    verbose: bool = False,
+    reporter: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[ContextInspection]:
     """Measure initial prompt tokens for AWM records, preserving input order."""
     if type(concurrency) is not int or concurrency < 1:
         raise ValueError("concurrency must be a positive integer")
+    if type(progress_every) is not int or progress_every < 1:
+        raise ValueError("progress_every must be a positive integer")
     protocol = QwenChatProtocol(tokenizer)
     semaphore = asyncio.Semaphore(concurrency)
+    completed = tokenized = failures = 0
+    progress_lock = asyncio.Lock()
+    started = time.monotonic()
+    _emit(
+        {
+            "event": "started",
+            "tasks": len(records),
+            "concurrency": concurrency,
+            "timeout_seconds": timeout,
+            "url": url,
+            "progress_every": progress_every,
+        },
+        reporter,
+    )
+
+    async def report(inspection: ContextInspection) -> None:
+        nonlocal completed, tokenized, failures
+        async with progress_lock:
+            completed += 1
+            if inspection.error:
+                failures += 1
+                _emit(
+                    {
+                        "event": "task_error",
+                        "completed": completed,
+                        "tasks": len(records),
+                        "task_id": inspection.task_id,
+                        "scenario": inspection.scenario,
+                        "task_idx": inspection.task_idx,
+                        "stage": inspection.stage,
+                        "error": inspection.error,
+                    },
+                    reporter,
+                )
+            elif inspection.prompt_tokens is not None:
+                # The caller supplies the token budget only after this helper
+                # returns, so this count is intentionally called ``tokenized``.
+                tokenized += 1
+                if verbose:
+                    _emit(
+                        {
+                            "event": "task_tokenized",
+                            "completed": completed,
+                            "tasks": len(records),
+                            "task_id": inspection.task_id,
+                            "scenario": inspection.scenario,
+                            "task_idx": inspection.task_idx,
+                            "prompt_tokens": inspection.prompt_tokens,
+                        },
+                        reporter,
+                    )
+            if completed % progress_every == 0 or completed == len(records):
+                _emit(
+                    {
+                        "event": "progress",
+                        "completed": completed,
+                        "tasks": len(records),
+                        "tokenized": tokenized,
+                        "failures": failures,
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                    },
+                    reporter,
+                )
 
     async def inspect(record: dict) -> ContextInspection:
         task = record["metadata"]["task"]
@@ -80,21 +164,36 @@ async def inspect_awm_contexts(
                     observation = await _fetch_initial_observation(task, url, timeout)
                 else:
                     observation = await observation_fetcher(task)
+        except Exception as exc:
+            inspection = ContextInspection(
+                task_id=task["id"],
+                scenario=task["scenario"],
+                task_idx=task["task_idx"],
+                prompt_tokens=None,
+                stage="environment_reset_or_tool_discovery",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            await report(inspection)
+            return inspection
+        try:
             _prompt, tokens = protocol.initial(observation, SYSTEM_PROMPT)
-            return ContextInspection(
+            inspection = ContextInspection(
                 task_id=task["id"],
                 scenario=task["scenario"],
                 task_idx=task["task_idx"],
                 prompt_tokens=len(tokens),
             )
         except Exception as exc:
-            return ContextInspection(
+            inspection = ContextInspection(
                 task_id=task["id"],
                 scenario=task["scenario"],
                 task_idx=task["task_idx"],
                 prompt_tokens=None,
+                stage="prompt_tokenization",
                 error=f"{type(exc).__name__}: {exc}",
             )
+        await report(inspection)
+        return inspection
 
     return list(await asyncio.gather(*(inspect(record) for record in records)))
 
@@ -126,6 +225,9 @@ def build_context_checked_manifest(
     report_path: str | Path | None = None,
     tokenizer=None,
     observation_fetcher=None,
+    progress_every: int = 100,
+    verbose: bool = False,
+    reporter: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     """Write a non-overwriting manifest that cannot fail the initial context check.
 
@@ -139,6 +241,8 @@ def build_context_checked_manifest(
         raise ValueError("timeout must be positive")
     if type(concurrency) is not int or concurrency < 1:
         raise ValueError("concurrency must be a positive integer")
+    if type(progress_every) is not int or progress_every < 1:
+        raise ValueError("progress_every must be a positive integer")
 
     input_path = Path(input_path).expanduser().resolve(strict=True)
     output_path = Path(output_path).expanduser()
@@ -162,6 +266,9 @@ def build_context_checked_manifest(
             timeout=float(timeout),
             concurrency=concurrency,
             observation_fetcher=observation_fetcher,
+            progress_every=progress_every,
+            verbose=verbose,
+            reporter=reporter,
         )
     )
     failures = [inspection for inspection in inspections if inspection.error]
@@ -202,6 +309,7 @@ def build_context_checked_manifest(
         "acceptance_rule": "initial_prompt_tokens < max_context_tokens",
         "timeout_seconds": timeout,
         "concurrency": concurrency,
+        "progress_every": progress_every,
         "task_count": len(records),
         "accepted_task_count": len(accepted),
         "excluded_context_task_count": len(excluded),
@@ -229,6 +337,8 @@ def main(argv=None) -> None:
     parser.add_argument("--max-context-tokens", type=int, required=True)
     parser.add_argument("--timeout", type=float, default=180)
     parser.add_argument("--concurrency", type=int, default=16)
+    parser.add_argument("--progress-every", type=int, default=100)
+    parser.add_argument("--verbose", action="store_true", help="log every successful task's token count")
     parser.add_argument("--report", help="Optional non-overwriting JSON audit report")
     args = parser.parse_args(argv)
     result = build_context_checked_manifest(
@@ -240,6 +350,8 @@ def main(argv=None) -> None:
         timeout=args.timeout,
         concurrency=args.concurrency,
         report_path=args.report,
+        progress_every=args.progress_every,
+        verbose=args.verbose,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
 

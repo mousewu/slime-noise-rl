@@ -188,22 +188,39 @@ class AWMEnvironment:
             raise
 
     @staticmethod
-    def _check(result):
+    def _check(result, *, stage="AWM request"):
         obs = _observation(result)
         kind = _field(obs, "reward_type")
         if kind in {"server_error", "timeout", "no_verifier", "reset_warning", "judge_error"}:
-            raise RuntimeError(f"AWM infrastructure/verifier error: {kind}: {_field(obs, 'error', '')}")
+            # ``reset_warning`` places its only useful diagnosis in ``warning``
+            # rather than ``error``.  Include both fields so a context audit or
+            # rollout log tells the operator whether reset, tool discovery, or
+            # the verifier actually failed.
+            detail = _field(obs, "error", "") or _field(obs, "warning", "") or ""
+            raise RuntimeError(
+                f"AWM infrastructure/verifier error during {stage}: {kind}: {detail}"
+            )
         return obs
 
     async def _reset(self):
         self.client = self.client_factory(base_url=self.url, timeout=self.timeout)
-        result = await self.client.reset(scenario=self.task["scenario"], task_idx=self.task["task_idx"])
-        obs = self._check(result)
+        try:
+            result = await self.client.reset(scenario=self.task["scenario"], task_idx=self.task["task_idx"])
+        except Exception as exc:
+            raise RuntimeError(
+                f"AWM reset transport failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        obs = self._check(result, stage="reset")
         has_code_verifier = (_field(obs, "has_verifier") or {}).get("code")
         if _field(obs, "reward_type") != "reset_ok" or not has_code_verifier:
             raise RuntimeError(f"AWM requires a successful reset and code verifier: {_field(obs, 'error', '')}")
-        tools_result = await self.client.list_tools()
-        tools_observation = self._check(tools_result)
+        try:
+            tools_result = await self.client.list_tools()
+        except Exception as exc:
+            raise RuntimeError(
+                f"AWM tool-discovery transport failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        tools_observation = self._check(tools_result, stage="list_tools")
         if _field(tools_observation, "error"):
             raise RuntimeError(f"AWM tool discovery failed: {_field(tools_observation, 'error')}")
         descriptions = [
@@ -234,7 +251,7 @@ class AWMEnvironment:
             if final_answer is not None:
                 verify_arguments["final_answer"] = final_answer
             result = await self.client.call_tool("verify", verify_arguments)
-            obs = self._check(result)
+            obs = self._check(result, stage="verify")
             reward_type = _field(obs, "reward_type")
             # OpenEnv's code verifier uses ``others`` for a normal failed
             # verification.  Older server variants used ``incomplete``.

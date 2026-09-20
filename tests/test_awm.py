@@ -40,6 +40,28 @@ def test_awm_fails_closed_on_server_and_verifier_errors():
             AWMEnvironment._check({"observation": {"reward_type": kind}})
 
 
+def test_awm_reset_warning_reports_the_server_warning_and_stage():
+    with pytest.raises(RuntimeError, match="during reset: reset_warning: no tools discovered"):
+        AWMEnvironment._check(
+            {"observation": {"reward_type": "reset_warning", "warning": "no tools discovered"}},
+            stage="reset",
+        )
+
+
+def test_awm_reset_reports_transport_stage():
+    class BrokenClient:
+        async def reset(self, **_kwargs):
+            raise ConnectionError("service closed")
+
+    environment = AWMEnvironment(
+        {"scenario": "test", "task_idx": 0},
+        "http://unused.invalid",
+        client_factory=lambda **_kwargs: BrokenClient(),
+    )
+    with pytest.raises(RuntimeError, match="AWM reset transport failed: ConnectionError: service closed"):
+        asyncio.run(environment._reset())
+
+
 def test_awm_configuration_is_separate():
     from pathlib import Path
     root = Path(__file__).parents[1]

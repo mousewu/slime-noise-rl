@@ -51,6 +51,32 @@ def test_context_inspection_preserves_record_order_and_reports_token_counts():
     assert inspections[1].prompt_tokens > inspections[0].prompt_tokens
 
 
+async def broken_environment_observation(_task):
+    raise RuntimeError("no tools available")
+
+
+def test_context_inspection_reports_task_and_environment_stage_on_failure():
+    events = []
+    inspections = asyncio.run(
+        inspect_awm_contexts(
+            [awm_record("awm/scenario/0", "ignored")],
+            tokenizer=ByteTokenizer(),
+            url="http://unused.invalid",
+            timeout=1,
+            concurrency=1,
+            progress_every=1,
+            observation_fetcher=broken_environment_observation,
+            reporter=events.append,
+        )
+    )
+
+    assert inspections[0].stage == "environment_reset_or_tool_discovery"
+    task_error = next(event for event in events if event["event"] == "task_error")
+    assert task_error["task_id"] == "awm/scenario/0"
+    assert task_error["stage"] == "environment_reset_or_tool_discovery"
+    assert "no tools available" in task_error["error"]
+
+
 def test_context_checked_manifest_excludes_only_strictly_over_budget_rows(tmp_path):
     records = [
         awm_record("awm/scenario/0", "short"),

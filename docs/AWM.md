@@ -296,6 +296,25 @@ bash scripts/replay_awm_tasks_with_model.sh
 创建已存在对象或漏掉前置步骤。只有审阅完整轨迹、确认故障动作是完成该题的必要步骤后，才将该行复制到
 已审核 incidents 文件并改为 `required_for_task: true`，再交给 `preflight_awm_tasks.sh` 重放和过滤。
 
+为避免在数百条候选中手工查找原始轨迹，可在 `replay_awm_tool_incidents.sh` 产生的新 session 重放结果
+上建立审核队列。它只抽取每次重放都得到 `confirmed_http_422`、`confirmed_http_500` 或
+`target_tool_not_discoverable` 的精确动作，并补充 AWM 原始任务文本、重放响应和完整模型轨迹的
+`path:line` 位置。它不启动模型或 AWM 服务，也不会修改 manifest：
+
+```bash
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+AWM_DATA_DIR=/datasets/AgentWorldModel-1K \
+AWM_INCIDENT_RECHECK=runs/awm-model-replay-full.recheck.jsonl \
+AWM_REVIEW_QUEUE_OUTPUT=runs/awm-model-replay-full.review-queue.jsonl \
+AWM_REVIEW_QUEUE_REPORT=runs/awm-model-replay-full.review-queue.REPORT.md \
+bash scripts/build_awm_incident_review_queue.sh
+```
+
+审核队列仍会保留 `required_for_task: false`。将确认为必要动作的行复制到例如
+`configs/awm_replay_reviewed_incidents.jsonl`，把该字段改为 `true`，然后按前文的
+`preflight_awm_tasks.sh` 命令生成新的训练 manifest。不要直接把审核队列交给 preflight：这样做会
+重放证据，但不会产生任何排除。
+
 全量任务较多时可按稳定哈希切成互不重叠的分片，例如将以下两个作业并行执行；每个分片必须使用不同输出
 路径，完成后合并 JSONL 供分析，而不是让多个进程写同一个文件：
 

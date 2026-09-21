@@ -26,6 +26,7 @@ noise-rl-awm-smoke = "noise_rl.awm_smoke:main"
 noise-rl-awm-tool-audit = "noise_rl.awm_tool_audit:main"
 noise-rl-awm-filter = "noise_rl.awm_filter:main"
 noise-rl-awm-model-replay = "noise_rl.awm_model_replay:main"
+noise-rl-awm-incident-review-queue = "noise_rl.awm_incident_review_queue:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

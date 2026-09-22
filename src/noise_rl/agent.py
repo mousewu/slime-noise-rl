@@ -284,16 +284,19 @@ class Trajectory:
 
 
 class QwenChatProtocol:
-    """Append-only Qwen3 chat framing: never re-tokenize previously generated text.
+    """Append-only Qwen-style chat framing; never re-tokenize prior model output.
 
-    Explicitly limited to Qwen-style im_start/im_end chat templates. Other model
-    families need their own protocol and prefix-equivalence tests.
+    The generation prefix is taken from the selected tokenizer's own template.
+    This matters for Arctic-AWM-4B: with thinking disabled its template appends
+    an empty ``<think>...</think>`` block after the assistant role. Other model
+    families still need their own protocol and prefix-equivalence tests.
     """
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self.end_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
         self.start_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+        self.assistant_prefix = ""
         for text, token in (
             ("<|im_end|>", self.end_id),
             ("<|im_start|>", self.start_id),
@@ -318,11 +321,18 @@ class QwenChatProtocol:
         text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
-        # The selected Instruct-2507 template must end directly at the assistant prefix.
-        if not text.endswith("<|im_start|>assistant\n"):
+        assistant_open = "<|im_start|>assistant\n"
+        prefix_start = text.rfind(assistant_open)
+        if prefix_start < 0:
             raise ValueError(
-                "Unsupported chat template: use Qwen3-4B-Instruct-2507, not a Thinking template"
+                "Unsupported chat template: expected a Qwen-style assistant generation prefix"
             )
+        self.assistant_prefix = text[prefix_start + len(assistant_open) :]
+        # Only permit the template's in-channel prefix here, not a second chat
+        # message/end marker. The tokenizer template is trusted; observations are
+        # separately escaped before they are appended to the conversation.
+        if "<|im_start|>" in self.assistant_prefix or "<|im_end|>" in self.assistant_prefix:
+            raise ValueError("Unsupported chat template: assistant prefix contains chat boundary tokens")
         return text, self.tokenizer.encode(text, add_special_tokens=False)
 
     def observation_segment(self, observation):
@@ -330,6 +340,7 @@ class QwenChatProtocol:
             "\n<|im_start|>user\n"
             + self.safe_observation(observation)
             + "<|im_end|>\n<|im_start|>assistant\n"
+            + self.assistant_prefix
         )
         return Segment(
             self.tokenizer.encode(text, add_special_tokens=False), None, text, False

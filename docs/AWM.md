@@ -328,6 +328,81 @@ AWM_MODEL_REPLAY_OUTPUT=runs/awm-model-replay-shard1.jsonl \
 bash scripts/replay_awm_tasks_with_model.sh
 ```
 
+### 从已验证成功 replay 构建 action-only SFT 数据
+
+固定策略 replay 中的成功轨迹可作为 AWM 的 SFT warm start。已有
+`replay_awm_tasks_with_model.sh` 就是数据采集器：它本来就支持指定本地模型对应的 SGLang 服务、每题多次独立
+采样（`AWM_MODEL_REPLAY_REPEATS`）和采样温度。新增的 `replay_awm_teacher_for_sft.sh` 是面向 SFT 的薄封装，
+会先检查过滤后训练 manifest 的 split 与 `valid_unseen` scenario 不相交，再调用同一个生产 rollout harness。
+因此无需另写一份模型推理或环境交互逻辑。SGLang 必须预先加载你选择的 teacher；`HF_CHECKPOINT` 指向同一
+模型的本地 tokenizer/checkpoint，用于复现线上 prompt 并比对 hash。
+
+轨迹只使用**干净 session 中由
+code verifier 判为 `complete`** 的轨迹；不能把 `others`、格式错误、工具 5xx、带 action/observation
+噪声的 rollout 当成示范。本项目的构建器严格重建线上 harness 的多轮对话：AWM system prompt、reset
+后完整 task/tool observation、canonical tool JSON 和每次工具返回；仅 assistant 的 action token 使用
+`step_loss_mask=1`。
+
+新版本 `replay_awm_tasks_with_model.sh` 的 JSONL 已保存原始 `initial_observation`。历史 replay 没有该字段时，
+需要让构建器连接**已经启动**的本地 AWM 服务，重新 reset 同一 task；它会以原 replay 的 initial prompt
+SHA-256 与 token 数核对 tool schema 和模板未变。任何不一致的轨迹都会被拒绝，而不是悄悄写进 SFT 数据。
+此步骤只加载本地 tokenizer，不启动 SGLang、Ray 或训练，也不下载模型或数据。
+
+```bash
+cd /path/to/slime-noise-rl
+
+# 用更强的 teacher 在已过滤训练集上多次采样。SGLang/AWM 服务需预先启动。
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+HF_CHECKPOINT=/models/your-teacher-tokenizer \
+AWM_TRAIN_MANIFEST=data/awm/train.task-preflight.ctx16k.tool-filtered.jsonl \
+AWM_VALID_UNSEEN_MANIFEST=data/awm/valid_unseen.jsonl \
+AWM_URL=http://127.0.0.1:8899 \
+SGLANG_URL=http://127.0.0.1:30000 \
+AWM_TEACHER_REPEATS=4 \
+AWM_TEACHER_TEMPERATURE=0.7 \
+AWM_TEACHER_CONCURRENCY=8 \
+AWM_TEACHER_REPLAY_OUTPUT=runs/awm-teacher-replay.jsonl \
+bash scripts/replay_awm_teacher_for_sft.sh
+
+# 对新 replay 构建 SFT：不需要连接 AWM server。
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507 \
+AWM_SFT_REPLAY=runs/awm-teacher-replay.jsonl \
+AWM_SFT_OUTPUT=data/awm/sft/verified-replay.jsonl \
+AWM_SFT_REPORT=data/awm/sft/verified-replay.report.json \
+AWM_SFT_MAX_PER_SCENARIO=20 \
+bash scripts/build_awm_sft_data.sh
+
+# 对历史 replay：增加 AWM_SFT_AWM_URL 以严格补建初始 observation。
+AWM_SFT_AWM_URL=http://127.0.0.1:8899 \
+AWM_SFT_REPLAY=runs/awm-model-replay-pilot-2.jsonl \
+HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507 \
+AWM_SFT_OUTPUT=data/awm/sft/verified-replay-legacy.jsonl \
+AWM_SFT_REPORT=data/awm/sft/verified-replay-legacy.report.json \
+bash scripts/build_awm_sft_data.sh
+```
+
+默认每个 task 最多保留一条成功轨迹、每个 scenario 最多保留 20 条，并优先选择动作较短的完成轨迹；可用
+`AWM_SFT_MAX_PER_TASK`、`AWM_SFT_MAX_PER_SCENARIO`、`AWM_SFT_MAX_ACTIONS` 调整。构建器会拒绝任何含
+format error、工具 error/422/500/timeout 证据、fault audit 注入记录或非零噪声配置的轨迹。Replay 中正常完成
+reset、list-tools 和 verify 是入选前提；这些阶段抛错会被回放器记录为 exception，无法通过成功状态筛选。
+报告会保存候选/保留/拒绝数量、拒绝原因、场景数、
+工具调用分布、action 数分布、初始 observation 是直接读取还是严格回填，以及输入/输出 SHA-256。输出和报告
+均拒绝覆盖已有文件。
+
+产物可直接传给项目现有 Slime SFT 入口；它会根据 `metadata.dataset` 自动启用 AWM schema 校验：
+
+```bash
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+SLIME_DIR=/workspace/slime \
+HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507 \
+MEGATRON_CHECKPOINT=/models/Qwen3-4B-Instruct-2507_torch_dist \
+bash scripts/train_alfworld_sft.sh \
+  --data data/awm/sft/verified-replay.jsonl \
+  --output runs/awm-verified-replay-sft \
+  --gpus 4 --tensor-parallel 2 --batch-size 32 --epochs 3
+```
+
 ### 初始上下文审计（必做）
 
 AWM 的初始 observation 包含任务和完整工具 schema，其 token 数不能只从原始 JSONL

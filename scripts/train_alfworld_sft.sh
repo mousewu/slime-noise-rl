@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Offline Slime SFT: no SGLang server and no environment interaction occur in
-# this phase.  The data must have been built locally with sft_data.py first.
+# this phase.  The data must be a locally verified ALFWorld or AWM SFT JSONL.
 TASK_PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TASK_PYTHON_BIN="${PYTHON_BIN:-python}"
 TASK_MEGATRON_LM_DIR="${MEGATRON_LM_DIR:-}"

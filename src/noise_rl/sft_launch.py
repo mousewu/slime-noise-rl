@@ -9,6 +9,7 @@ import sys
 import uuid
 from pathlib import Path
 
+from .awm_sft_data import AWM_SFT_DATASET, validate_awm_sft_records
 from .data import atomic_json
 from .launch import (
     _TRACKING_OPTIONS,
@@ -131,7 +132,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--slime-dir", default=os.environ.get("SLIME_DIR"), required=not os.environ.get("SLIME_DIR")
     )
-    parser.add_argument("--data", required=True, help="Verified JSONL from noise_rl.sft_data")
+    parser.add_argument(
+        "--data",
+        required=True,
+        help="Verified ALFWorld planner or AWM code-verifier replay SFT JSONL",
+    )
     parser.add_argument("--hf-checkpoint", required=True)
     parser.add_argument("--megatron-checkpoint", required=True)
     parser.add_argument("--output", required=True)
@@ -175,6 +180,20 @@ def _validate_arguments(args, parser: argparse.ArgumentParser) -> None:
         parser.error("--max-tokens-per-gpu must be at least 1024")
 
 
+def validate_sft_input(path: str | Path) -> dict:
+    """Dispatch to the strict validator matching the dataset's declared type."""
+    source = Path(path).expanduser().resolve(strict=True)
+    with source.open(encoding="utf-8") as stream:
+        for line in stream:
+            if line.strip():
+                first = json.loads(line)
+                metadata = first.get("metadata", {}) if isinstance(first, dict) else {}
+                if isinstance(metadata, dict) and metadata.get("dataset") == AWM_SFT_DATASET:
+                    return validate_awm_sft_records(source)
+                return validate_sft_records(source)
+    raise ValueError(f"SFT dataset is empty: {source}")
+
+
 def main(argv=None) -> None:
     megatron_lm_dir = configure_megatron_lm_path()
     parser = _parser()
@@ -183,7 +202,12 @@ def main(argv=None) -> None:
     slime_commit = verify_slime(args.slime_dir, "train_async.py")
     verify_sft_capability(args.slime_dir)
     validate_local_checkpoints(args.hf_checkpoint, args.megatron_checkpoint)
-    dataset = validate_sft_records(args.data)
+    dataset = validate_sft_input(args.data)
+    phase = (
+        "awm_verified_replay_sft"
+        if dataset.get("dataset") == AWM_SFT_DATASET
+        else "alfworld_expert_sft"
+    )
     command = build_command(args)
     print(shlex.join(command), flush=True)
     if args.dry_run:
@@ -209,7 +233,7 @@ def main(argv=None) -> None:
             raise ValueError("Cannot resume with different SwanLab project, experiment, or storage settings")
     metadata = {
         "schema": 1,
-        "phase": "alfworld_expert_sft",
+        "phase": phase,
         "slime_commit": slime_commit,
         "dataset": dataset,
         "training_options": invariants,
@@ -256,7 +280,7 @@ def main(argv=None) -> None:
     env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
     if tracking:
         experiment = {
-            "phase": "alfworld_expert_sft",
+            "phase": phase,
             "slime_commit": slime_commit,
             "dataset": dataset,
             "training": invariants,

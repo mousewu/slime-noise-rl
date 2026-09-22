@@ -34,7 +34,13 @@ class _Client:
 
 async def _server_failure_trajectory(*_args):
     action = json.dumps({"tool_name": "create_schedule", "arguments": {"name": "Duplicate"}})
-    trajectory = Trajectory("prompt", [1], environment="awm", termination="environment_terminal")
+    trajectory = Trajectory(
+        "prompt",
+        [1],
+        initial_observation='{"task":"Create a schedule","tools":[]}',
+        environment="awm",
+        termination="environment_terminal",
+    )
     trajectory.steps = [
         {
             "turn": 0,
@@ -82,6 +88,7 @@ def test_model_replay_streams_trace_and_emits_non_excluding_candidates(tmp_path)
     candidate_rows = [json.loads(line) for line in incidents.read_text(encoding="utf-8").splitlines()]
     assert len(rows) == 2
     assert all(row["status"] == "tool_terminal_failure" for row in rows)
+    assert all(row["initial_observation"] == '{"task":"Create a schedule","tools":[]}' for row in rows)
     assert report["candidate_incident_count"] == 1
     assert report["terminal_tool_failure_counts"] == {"server_error": 2}
     assert candidate_rows == [

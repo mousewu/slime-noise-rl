@@ -199,6 +199,7 @@ def validate_sft_records(path: str | Path) -> dict:
     return {
         "path": str(path),
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "dataset": "alfworld_planner_sft",
         "records": rows,
         "expert_actions": actions,
     }

@@ -247,6 +247,10 @@ class Trajectory:
     prompt_text: str
     prompt_tokens: list[int]
     environment: str = ""
+    # AWM replay data needs this raw reset/tool-discovery payload to reconstruct
+    # the exact online multi-turn context for action-only SFT.  It stays None
+    # for environments whose replay format does not persist an initial prompt.
+    initial_observation: str | None = None
     segments: list[Segment] = field(default_factory=list)
     success: bool = False
     termination: str = "pending"
@@ -445,6 +449,7 @@ async def run_episode(
             trajectory = Trajectory(
                 prompt,
                 prompt_tokens,
+                initial_observation=initial.observation,
                 environment=str(task.get("environment", "")),
                 in_flight_episodes_at_start=in_flight_at_start,
                 environment_runner_wait_seconds=runner_wait_seconds,

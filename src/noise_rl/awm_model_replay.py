@@ -175,6 +175,9 @@ def _trajectory_row(
         task=_task_metadata(task),
         attempt=attempt,
         status=_status_for_trajectory(trajectory),
+        # Retain the unescaped observation.  The SFT builder applies the same
+        # Qwen control-token escaping as run_episode before serializing it.
+        initial_observation=trajectory.initial_observation,
         initial_prompt_tokens=len(trajectory.prompt_tokens),
         initial_prompt_sha256=hashlib.sha256(
             trajectory.prompt_text.encode("utf-8")

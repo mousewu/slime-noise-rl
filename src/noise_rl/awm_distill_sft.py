@@ -25,6 +25,60 @@ from .awm_sft_data import (
     _write_rows,
 )
 
+DISTILLATION_DATASET = "awm_teacher_distillation_sft"
+
+
+def validate_distillation_sft_records(path: str | Path) -> dict[str, Any]:
+    """Validate the student-side messages emitted by this distillation builder."""
+    path = Path(path).expanduser().resolve(strict=True)
+    records = actions = 0
+    task_ids = set()
+    with path.open(encoding="utf-8") as stream:
+        for line_number, line in enumerate(stream, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                messages = row["messages"]
+                metadata = row["metadata"]
+                if not isinstance(messages, list) or len(messages) < 3:
+                    raise ValueError("messages must contain system, user, and action")
+                expected = [("system", 0), ("user", 0)]
+                for message in messages:
+                    if not isinstance(message, dict) or message.get("role") not in {"system", "user", "assistant"}:
+                        raise ValueError("invalid message role")
+                if messages[0].get("role") != "system" or messages[1].get("role") != "user":
+                    raise ValueError("messages must start with system and user")
+                for message in messages[2:]:
+                    if message.get("role") == "assistant":
+                        if message.get("step_loss_mask") != 1:
+                            raise ValueError("assistant action must have step_loss_mask=1")
+                        value = json.loads(message["content"])
+                        if not isinstance(value, dict) or set(value) != {"tool_name", "arguments"}:
+                            raise ValueError("invalid AWM tool action")
+                        actions += 1
+                    elif message.get("role") == "user":
+                        if message.get("step_loss_mask") != 0:
+                            raise ValueError("user observation must have step_loss_mask=0")
+                    else:
+                        raise ValueError("messages must alternate assistant and user")
+                if messages[-1].get("role") != "assistant":
+                    raise ValueError("trajectory must end with assistant action")
+                if not isinstance(metadata, dict) or metadata.get("dataset") != DISTILLATION_DATASET:
+                    raise ValueError("unexpected distillation dataset")
+                task_id = metadata.get("task_id")
+                if not isinstance(task_id, str) or not task_id or task_id in task_ids:
+                    raise ValueError("task_id must be nonempty and unique")
+                if metadata.get("environment") != "awm" or metadata.get("split") != "train":
+                    raise ValueError("distillation data must be AWM train data")
+                task_ids.add(task_id)
+                records += 1
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Invalid AWM distillation SFT data {path}:{line_number}: {exc}") from exc
+    if not records:
+        raise ValueError(f"AWM distillation SFT dataset is empty: {path}")
+    return {"path": str(path), "dataset": DISTILLATION_DATASET, "records": records, "expert_actions": actions, "unique_tasks": len(task_ids)}
+
 
 def _student_row(row, task, actions, observation, *, line, replay_path, replay_sha256, tokenizer):
     protocol = QwenChatProtocol(tokenizer)

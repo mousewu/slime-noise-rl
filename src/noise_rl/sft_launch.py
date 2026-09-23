@@ -9,6 +9,7 @@ import sys
 import uuid
 from pathlib import Path
 
+from .awm_distill_sft import DISTILLATION_DATASET, validate_distillation_sft_records
 from .awm_sft_data import AWM_SFT_DATASET, validate_awm_sft_records
 from .data import atomic_json
 from .launch import (
@@ -190,6 +191,8 @@ def validate_sft_input(path: str | Path) -> dict:
                 metadata = first.get("metadata", {}) if isinstance(first, dict) else {}
                 if isinstance(metadata, dict) and metadata.get("dataset") == AWM_SFT_DATASET:
                     return validate_awm_sft_records(source)
+                if isinstance(metadata, dict) and metadata.get("dataset") == DISTILLATION_DATASET:
+                    return validate_distillation_sft_records(source)
                 return validate_sft_records(source)
     raise ValueError(f"SFT dataset is empty: {source}")
 

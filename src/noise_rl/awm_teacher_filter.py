@@ -169,6 +169,7 @@ def filter_teacher_replay(
     report.parent.mkdir(parents=True, exist_ok=True)
     if report.exists():
         raise FileExistsError(f"Refusing to overwrite report: {report}")
+    result["report"] = str(report)
     report.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return result
 

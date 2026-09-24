@@ -10,7 +10,8 @@ noise_rl:
   environment_workers: 32
   environment_processes: 0
   awm_url: http://127.0.0.1:8899
-  max_turns: 40
+  max_turns: 20
+  history_window: 3
   max_tool_calls: 50
   # AWM injects the full tool schema into the first user observation.  Run
   # scripts/audit_awm_context.sh before training and do not admit a task whose

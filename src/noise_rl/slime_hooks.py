@@ -8,7 +8,7 @@ from .advantages import group_advantages
 from .agent import SGLangAbort, SGLangClient, run_episode
 from .config import NoiseConfig, config_from_args
 from .data import atomic_json, read_records
-from .metrics import episode_record, summarize, trace_metrics
+from .metrics import episode_record, percentile95, summarize, trace_metrics
 from .sampling import SamplingPlan, plan_sample
 from .swanlab_bridge import report_metrics, report_metrics_nonblocking, report_rollout_timing
 
@@ -160,6 +160,20 @@ def reward_postprocess(args, samples):
                     "advantage_second_moment"
                 ],
                 "rollout/groups": len({plan.group_id for plan in plans}),
+                "train_tokens": sum(record.get("generated_tokens", 0) for record in records),
+                "train_sequence_length_mean": sum(
+                    record.get("context_tokens", 0) for record in records
+                ) / len(records),
+                "train_sequence_length_p95": percentile95(
+                    record.get("context_tokens", 0) for record in records
+                ),
+                "environment_error_rate": sum(
+                    1.0 if record.get("termination") == "environment_terminal" or any(
+                        isinstance(step.get("environment_info"), dict)
+                        and step.get("environment_info", {}).get("awm", {}).get("tool_terminal_failure")
+                        for step in record.get("steps", [])
+                    ) else 0.0 for record in records
+                ) / len(records),
             }
         )
         logger.info("noise_rl rollout_metrics: %s", metrics)

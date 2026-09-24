@@ -267,6 +267,7 @@ class Trajectory:
     environment_runner_recycled: bool = False
     environment_runner_restarts_total: int = 0
     in_flight_episodes_at_start: int = 0
+    history_window: int = 0
 
     @property
     def tokens(self):
@@ -464,7 +465,11 @@ async def run_episode(
                 environment=str(task.get("environment", "")),
                 in_flight_episodes_at_start=in_flight_at_start,
                 environment_runner_wait_seconds=runner_wait_seconds,
+                history_window=config.history_window,
             )
+            # Keep the complete trace for auditing/training, while using the
+            # same bounded history policy for each subsequent inference call.
+            inference_history: list[list[int]] = []
             params = dict(
                 sampling_params or {"temperature": 0.8, "top_p": 1.0, "top_k": -1}
             )
@@ -481,7 +486,12 @@ async def run_episode(
                 skip_special_tokens=False,
             )
             for turn in range(config.max_turns):
-                token_ids = trajectory.tokens
+                if config.history_window:
+                    token_ids = list(trajectory.prompt_tokens)
+                    for interaction in inference_history[-config.history_window :]:
+                        token_ids.extend(interaction)
+                else:
+                    token_ids = trajectory.tokens
                 remaining = min(
                     config.max_generated_tokens - trajectory.generated_tokens,
                     config.max_context_tokens - len(token_ids),
@@ -610,14 +620,25 @@ async def run_episode(
                             )
                         )
                         break
+                # An interaction is an action plus the observation it caused.
+                # Keep it as one unit so the sliding window cannot separate a
+                # tool call from its result. Format errors are observations too.
+                if trajectory.segments and trajectory.segments[-1].trainable:
+                    bridge_preview = protocol.observation_segment(observation)
+                    inference_history.append(
+                        trajectory.segments[-1].tokens + bridge_preview.tokens
+                    )
                 if turn + 1 == config.max_turns:
                     trajectory.termination = "turn_budget"
                     break
                 bridge = protocol.observation_segment(observation)
-                if (
-                    len(trajectory.tokens) + len(bridge.tokens)
-                    >= config.max_context_tokens
-                ):
+                if config.history_window:
+                    next_context_len = len(trajectory.prompt_tokens) + sum(
+                        len(item) for item in inference_history[-config.history_window :]
+                    )
+                else:
+                    next_context_len = len(trajectory.tokens) + len(bridge.tokens)
+                if next_context_len >= config.max_context_tokens:
                     trajectory.termination = "context_budget"
                     break  # No silent history truncation or retokenization.
                 trajectory.segments.append(bridge)

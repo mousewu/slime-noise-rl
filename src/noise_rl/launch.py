@@ -328,6 +328,11 @@ def main(argv=None, fully_async=False):
         help="Override noise_rl.max_context_tokens without editing the base YAML",
     )
     parser.add_argument(
+        "--history-window",
+        type=int,
+        help="Number of recent interaction turns retained in rollout context",
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         help="Override noise_rl.concurrency (the total SGLang request capacity)",
@@ -386,7 +391,7 @@ def main(argv=None, fully_async=False):
         "seed": args.seed,
         "trace_dir": str(Path(args.output).expanduser().resolve() / "traces"),
     }
-    for key in ("max_context_tokens", "concurrency", "environment_workers"):
+    for key in ("max_context_tokens", "history_window", "concurrency", "environment_workers"):
         value = getattr(args, key)
         if value is not None:
             overrides[key] = value

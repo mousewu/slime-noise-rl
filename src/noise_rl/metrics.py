@@ -4,6 +4,15 @@ import random
 from collections import Counter, defaultdict
 from statistics import mean
 
+
+def percentile95(values):
+    """Dependency-free nearest-rank p95 for finite metric batches."""
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return 0.0
+    index = min(len(ordered) - 1, max(0, int(0.95 * len(ordered) + 0.999999) - 1))
+    return ordered[index]
+
 from .agent import Trajectory
 from .config import ExperimentConfig
 from .sampling import SamplingPlan
@@ -171,6 +180,19 @@ def trace_metrics(
         ),
         f"{prefix}/in_flight_episodes_at_start/max": max(
             record.get("in_flight_episodes_at_start", 1) for record in records
+        ),
+        f"{prefix}/train_tokens/total": sum(record.get("generated_tokens", 0) for record in records),
+        f"{prefix}/train_tokens/mean": mean(record.get("generated_tokens", 0) for record in records),
+        f"{prefix}/train_sequence_length_mean": mean(record.get("context_tokens", 0) for record in records),
+        f"{prefix}/train_sequence_length_p95": percentile95(
+            record.get("context_tokens", 0) for record in records
+        ),
+        f"{prefix}/environment_error_rate": mean(
+            1.0 if record.get("termination") == "environment_terminal" or any(
+                isinstance(step.get("environment_info"), dict)
+                and step.get("environment_info", {}).get("awm", {}).get("tool_terminal_failure")
+                for step in record.get("steps", [])
+            ) else 0.0 for record in records
         ),
         f"{prefix}/faults/action_drop_rate": (
             sum(bool(event.get("dropped")) for event in faults) / len(faults)

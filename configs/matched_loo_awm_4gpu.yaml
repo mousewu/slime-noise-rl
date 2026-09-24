@@ -11,7 +11,8 @@ noise_rl:
   environment_processes: 0
   # Override at launch with AWM_URL when the service is not local.
   awm_url: http://127.0.0.1:8899
-  max_turns: 40
+  max_turns: 20
+  history_window: 3
   max_tool_calls: 50
   # The initial AWM prompt contains complete tool schemas.  Build and use a
   # context-audited manifest before training; this is the strict prompt limit.

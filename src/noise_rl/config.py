@@ -32,6 +32,7 @@ class ExperimentConfig:
     std_normalization: bool = False
     noise: NoiseConfig = field(default_factory=NoiseConfig)
     max_turns: int = 40
+    history_window: int = 0
     max_tool_calls: int = 50
     max_context_tokens: int = 8192
     max_generated_tokens: int = 2048
@@ -73,6 +74,8 @@ class ExperimentConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if type(self.environment_processes) is not int or self.environment_processes < 0:
             raise ValueError("environment_processes must be a nonnegative integer")
+        if type(self.history_window) is not int or self.history_window < 0:
+            raise ValueError("history_window must be a nonnegative integer")
         if (
             type(self.environment_recycle_episodes) is not int
             or self.environment_recycle_episodes < 0

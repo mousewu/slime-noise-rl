@@ -7,6 +7,11 @@ noise_rl:
   environment_workers: 32
   environment_processes: 0
   awm_url: http://127.0.0.1:8899
+  max_turns: 20
+  history_window: 3
+  max_context_tokens: 16384
+  max_generated_tokens: 2048
+  max_tool_calls: 50
   max_tokens_per_turn: 256
   noise:
     action_drop: 0.15

@@ -438,7 +438,33 @@ def install_slime_logging_patch() -> None:
 
         def log(args, metrics, step_key: str):
             original_log(args, metrics, step_key)
-            _forward(metrics)
+            values = dict(metrics)
+            # Slime versions expose these timings under slightly different
+            # perf keys. Keep the original fields and add stable aliases.
+            aliases = {
+                "actor_train_time": (
+                    "actor_train_time",
+                    "perf/actor_train_time",
+                    "perf/update_time",
+                ),
+                "rollout_time": (
+                    "rollout_time",
+                    "perf/rollout_time",
+                    "perf/rollout_generation_time",
+                ),
+            }
+            for target, candidates in aliases.items():
+                for candidate in candidates:
+                    value = values.get(candidate)
+                    if isinstance(value, (int, float)):
+                        values[target] = value
+                        break
+                if target not in values:
+                    for key, value in values.items():
+                        if isinstance(value, (int, float)) and str(key).lower().endswith(target):
+                            values[target] = value
+                            break
+            _forward(values)
 
         log._noise_rl_swanlab_bridge = True
         logging_utils.log = log

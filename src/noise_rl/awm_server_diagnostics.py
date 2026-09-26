@@ -24,15 +24,17 @@ import json
 import logging
 import os
 import shutil
+import socket
 import sqlite3
+import subprocess
+import sys
 from collections import Counter
 from contextlib import closing
 from pathlib import Path
 from threading import Lock
-from time import time
+from time import monotonic, sleep, time
 from typing import Any
 from uuid import uuid4
-
 
 _LOGGER = logging.getLogger(__name__)
 _DEFAULT_LOG_TAIL_BYTES = 24 * 1024
@@ -85,6 +87,165 @@ class _EvidenceBudget:
 
 
 _EVIDENCE_BUDGET = _EvidenceBudget()
+
+
+def _reserve_loopback_listener() -> socket.socket:
+    """Atomically reserve an ephemeral TCP port for inheritance by Uvicorn."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(128)
+        listener.set_inheritable(True)
+        return listener
+    except BaseException:
+        listener.close()
+        raise
+
+
+def _patch_scenario_code_for_listener(
+    scenario_module: Any,
+    full_code: str,
+    db_path: str,
+    host: str,
+    port: int,
+    listener_fd: int,
+) -> str:
+    patched = scenario_module._patch_env_code(full_code, db_path, host, port)
+    ordinary_launch = f"uvicorn.run(app, host='{host}', port={port})"
+    inherited_launch = f"uvicorn.run(app, fd={listener_fd})"
+    occurrences = patched.count(ordinary_launch)
+    if occurrences != 1:
+        raise RuntimeError(
+            "Could not replace the generated AWM Uvicorn launch with an inherited listener: "
+            f"expected one launch site, found {occurrences}"
+        )
+    return patched.replace(ordinary_launch, inherited_launch, 1)
+
+
+def _wait_for_inherited_mcp(process: Any, timeout: float) -> tuple[bool, str]:
+    """Wait for MCP, not just TCP: the inherited socket listens before app startup."""
+    deadline = monotonic() + timeout
+    last_error = ""
+    while monotonic() < deadline:
+        if process._process is None or process._process.poll() is not None:
+            return False, last_error
+        try:
+            process._connect_mcp()
+            return True, ""
+        except Exception as exc:
+            last_error = str(exc)
+            process._disconnect_mcp()
+            sleep(0.1)
+    return False, last_error
+
+
+def _install_atomic_scenario_start(scenario_module: Any) -> bool:
+    """Install race-free AWM sub-environment port handoff once per process."""
+    scenario_type = scenario_module.ScenarioProcess
+    if getattr(scenario_type, "_noise_rl_atomic_port_start_installed", False):
+        return False
+
+    def start(self, full_code: str, db_path: str, session_dir: str) -> str:
+        self.stop()
+        self._temp_dir = session_dir
+        self._owns_temp_dir = False
+        host = "127.0.0.1"
+        retries = int(getattr(scenario_module, "MAX_PORT_RETRIES", 5))
+        ready_timeout = float(getattr(scenario_module, "READY_TIMEOUT", 180.0))
+        retry_timeout = float(getattr(scenario_module, "RETRY_READY_TIMEOUT", 30.0))
+        last_error = ""
+
+        for attempt in range(1 + retries):
+            listener = None
+            try:
+                listener = _reserve_loopback_listener()
+                self._port = listener.getsockname()[1]
+                timeout = ready_timeout if attempt == 0 else retry_timeout
+                patched_code = _patch_scenario_code_for_listener(
+                    scenario_module,
+                    full_code,
+                    db_path,
+                    host,
+                    self._port,
+                    listener.fileno(),
+                )
+                self._server_py = f"{self._temp_dir}/server.py"
+                with open(self._server_py, "w", encoding="utf-8") as file:
+                    file.write(patched_code)
+
+                if attempt:
+                    scenario_module.logger.info(
+                        "Retry %d/%d with atomic listener handoff on port %d (timeout=%ss) ...",
+                        attempt,
+                        retries,
+                        self._port,
+                        timeout,
+                    )
+                else:
+                    scenario_module.logger.info(
+                        "Starting sub-env with atomic listener handoff on port %d ...",
+                        self._port,
+                    )
+
+                self._log_path = f"{self._temp_dir}/server.log"
+                self._log_file = open(
+                    self._log_path,
+                    "w" if attempt == 0 else "a",
+                    encoding="utf-8",
+                )
+                self._process = subprocess.Popen(
+                    [sys.executable, self._server_py],
+                    stdout=self._log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    text=True,
+                    pass_fds=(listener.fileno(),),
+                )
+            except Exception as exc:
+                last_error = f"Atomic sub-env launch failed on attempt {attempt + 1}: {exc}"
+                scenario_module.logger.warning(last_error)
+                self.stop()
+                continue
+            finally:
+                if listener is not None:
+                    listener.close()
+
+            ready, mcp_error = _wait_for_inherited_mcp(self, timeout)
+            if ready:
+                scenario_module.logger.info(
+                    "Sub-env ready on inherited port %d, mcp=persistent, log=%s",
+                    self._port,
+                    self._log_path,
+                )
+                return self.mcp_url
+
+            failed_port = self._port
+            if self._log_file is not None and not self._log_file.closed:
+                self._log_file.flush()
+            try:
+                logged_output = Path(self._log_path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                logged_output = ""
+            bind_conflict = (
+                "address already in use" in logged_output.lower()
+                or "errno 98" in logged_output.lower()
+            )
+            last_error = (
+                f"Sub-env failed to start on inherited port {failed_port} "
+                f"(timeout {timeout}s, bind_conflict={bind_conflict}, mcp_error={mcp_error!r}).\n"
+                f"Output: {logged_output}"
+            )
+            scenario_module.logger.warning(last_error)
+            self.stop()
+
+        raise RuntimeError(
+            f"Sub-env failed after {1 + retries} atomic launch attempts. Last error: {last_error}"
+        )
+
+    scenario_type.start = start
+    scenario_type._noise_rl_atomic_port_start_installed = True
+    _LOGGER.info("Installed project-local atomic AWM sub-environment port handoff")
+    return True
 
 
 def _diagnostics_directory() -> Path | None:
@@ -534,6 +695,14 @@ def _emit_diagnostic(
 
 def install_awm_server_diagnostics() -> None:
     """Patch OpenEnv's AWM methods once in the server process only."""
+    try:
+        scenario_module = importlib.import_module("agent_world_model_env.server.scenario_manager")
+    except ModuleNotFoundError:
+        # Unit tests and minimal diagnostic-only installations may provide the
+        # environment class without the optional AWM subprocess dependencies.
+        scenario_module = None
+    if scenario_module is not None:
+        _install_atomic_scenario_start(scenario_module)
     module = importlib.import_module("agent_world_model_env.server.awm_environment")
     environment_type = module.AWMEnvironment
     if getattr(environment_type, "_noise_rl_diagnostics_installed", False):

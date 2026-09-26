@@ -128,6 +128,69 @@ def windowed_train_sequences(trajectory, history_window):
     return sequences
 
 
+def _actor_data_parallel_size(args):
+    """Derive Megatron data parallelism from Slime's actor topology."""
+    topology = {
+        "actor_num_nodes": getattr(args, "actor_num_nodes", 1),
+        "actor_num_gpus_per_node": getattr(args, "actor_num_gpus_per_node", 1),
+        "tensor_model_parallel_size": getattr(args, "tensor_model_parallel_size", 1),
+        "pipeline_model_parallel_size": getattr(args, "pipeline_model_parallel_size", 1),
+        "context_parallel_size": getattr(args, "context_parallel_size", 1),
+    }
+    if any(type(value) is not int or value < 1 for value in topology.values()):
+        raise ValueError(f"Invalid actor parallel topology: {topology}")
+    actor_world_size = topology["actor_num_nodes"] * topology["actor_num_gpus_per_node"]
+    model_parallel_size = (
+        topology["tensor_model_parallel_size"]
+        * topology["pipeline_model_parallel_size"]
+        * topology["context_parallel_size"]
+    )
+    if actor_world_size % model_parallel_size:
+        raise ValueError(
+            "Actor world size must be divisible by TP * PP * CP: "
+            f"{actor_world_size} % {model_parallel_size} != 0"
+        )
+    return actor_world_size // model_parallel_size
+
+
+def _append_zero_loss_dp_padding(data, *, data_parallel_size, rollouts_per_step):
+    """Align action subtrajectories without changing the optimization signal.
+
+    Slime's dynamic micro-batch scheduler requires at least a DP-aligned
+    number of indivisible samples.  History-window conversion can produce an
+    arbitrary action count (for example 275 with DP=3).  Duplicate the
+    shortest sequence only as a structural carrier: its loss mask, old log
+    probabilities, advantage and raw reward are all zero.  Reusing its
+    rollout id also keeps the original GRPO group count unchanged.
+    """
+    if type(rollouts_per_step) is not int or rollouts_per_step < 1:
+        raise ValueError("global_batch_size must be a positive integer")
+    ordered_rollout_ids = list(dict.fromkeys(data["rollout_ids"]))
+    padding_count = 0
+    for start in range(0, len(ordered_rollout_ids), rollouts_per_step):
+        step_ids = set(ordered_rollout_ids[start : start + rollouts_per_step])
+        step_rows = [
+            index for index, rollout_id in enumerate(data["rollout_ids"]) if rollout_id in step_ids
+        ]
+        step_padding = (-len(step_rows)) % data_parallel_size
+        if step_padding == 0:
+            continue
+        source = min(step_rows, key=lambda index: len(data["tokens"][index]))
+        for _ in range(step_padding):
+            data["tokens"].append(list(data["tokens"][source]))
+            data["response_lengths"].append(data["response_lengths"][source])
+            data["rewards"].append(0.0)
+            data["raw_reward"].append(0.0)
+            data["truncated"].append(0)
+            data["sample_indices"].append(data["sample_indices"][source])
+            data["rollout_ids"].append(data["rollout_ids"][source])
+            response_length = data["response_lengths"][source]
+            data["loss_masks"].append([0] * response_length)
+            data["rollout_log_probs"].append([0.0] * response_length)
+        padding_count += step_padding
+    return padding_count
+
+
 def convert_samples_to_windowed_train_data(args, samples):
     """Convert complete rollouts into history-windowed per-action train data."""
     config = validate_slime_args(args)
@@ -172,18 +235,33 @@ def convert_samples_to_windowed_train_data(args, samples):
             data["rollout_ids"].append(rollout_id)
             data["loss_masks"].append(sequence["loss_mask"])
             data["rollout_log_probs"].append(sequence["rollout_log_probs"])
+    real_lengths = [len(tokens) for tokens in data["tokens"]]
+    real_action_tokens = sum(sum(mask) for mask in data["loss_masks"])
+    data_parallel_size = _actor_data_parallel_size(args)
+    padding_count = _append_zero_loss_dp_padding(
+        data,
+        data_parallel_size=data_parallel_size,
+        rollouts_per_step=getattr(args, "global_batch_size", len(samples)),
+    )
+    if padding_count:
+        logger.info(
+            "Added %d zero-loss history-window padding subtrajectory(s) for actor DP=%d: %d -> %d",
+            padding_count,
+            data_parallel_size,
+            len(real_lengths),
+            len(data["tokens"]),
+        )
     rollout_mask_totals = {}
     for rollout_id, mask in zip(data["rollout_ids"], data["loss_masks"], strict=True):
         rollout_mask_totals[rollout_id] = rollout_mask_totals.get(rollout_id, 0) + sum(mask)
     data["rollout_mask_sums"] = [rollout_mask_totals[value] for value in data["rollout_ids"]]
-    lengths = [len(tokens) for tokens in data["tokens"]]
     report_metrics(
         {
-            "train_tokens": sum(lengths),
-            "train_sequence_length_mean": sum(lengths) / len(lengths),
-            "train_sequence_length_p95": percentile95(lengths),
-            "train/action_tokens": sum(sum(mask) for mask in data["loss_masks"]),
-            "train/subtrajectories": len(lengths),
+            "train_tokens": sum(real_lengths),
+            "train_sequence_length_mean": sum(real_lengths) / len(real_lengths),
+            "train_sequence_length_p95": percentile95(real_lengths),
+            "train/action_tokens": real_action_tokens,
+            "train/subtrajectories": len(real_lengths),
             "train/original_rollouts": len(samples),
         }
     )

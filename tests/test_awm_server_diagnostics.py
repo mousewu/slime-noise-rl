@@ -1,9 +1,12 @@
 import json
 import logging
+import os
 import sqlite3
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+
+import pytest
 
 from noise_rl import awm_server_diagnostics
 
@@ -120,3 +123,83 @@ def test_runtime_hook_preserves_tool_error_and_captures_verifier_evidence(tmp_pa
     persisted = list((tmp_path / "diagnostics").glob("awm-diagnostic-*.json"))
     assert len(persisted) == 1
     assert json.loads(persisted[0].read_text())["diagnostic_path"].endswith(".json")
+
+
+def test_atomic_scenario_start_hands_listener_to_child_and_retries_bind_conflict(
+    tmp_path, monkeypatch
+):
+    launches = []
+
+    class FakePopen:
+        def __init__(self, command, **kwargs):
+            launches.append((command, kwargs))
+            if len(launches) == 1:
+                kwargs["stdout"].write("[Errno 98] address already in use\n")
+                kwargs["stdout"].flush()
+
+        def poll(self):
+            return None
+
+    class FakeScenarioProcess:
+        def __init__(self):
+            self._process = None
+            self._port = None
+            self._temp_dir = None
+            self._owns_temp_dir = False
+            self._server_py = None
+            self._log_file = None
+            self._log_path = None
+            self._connected = False
+
+        @property
+        def mcp_url(self):
+            return f"http://127.0.0.1:{self._port}/mcp"
+
+        def _connect_mcp(self):
+            self._connected = True
+
+        def _disconnect_mcp(self):
+            self._connected = False
+
+        def stop(self):
+            self._disconnect_mcp()
+            self._process = None
+            if self._log_file is not None:
+                self._log_file.close()
+                self._log_file = None
+            self._port = None
+            self._server_py = None
+
+    def patch_env_code(_full_code, _db_path, host, port):
+        return f"import uvicorn\nuvicorn.run(app, host='{host}', port={port})\n"
+
+    scenario_module = SimpleNamespace(
+        ScenarioProcess=FakeScenarioProcess,
+        _patch_env_code=patch_env_code,
+        MAX_PORT_RETRIES=2,
+        READY_TIMEOUT=1.0,
+        RETRY_READY_TIMEOUT=1.0,
+        logger=logging.getLogger("fake_awm_scenario_manager"),
+    )
+    readiness = iter([(False, "bind conflict"), (True, "")])
+    monkeypatch.setattr(awm_server_diagnostics.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(
+        awm_server_diagnostics,
+        "_wait_for_inherited_mcp",
+        lambda _process, _timeout: next(readiness),
+    )
+
+    assert awm_server_diagnostics._install_atomic_scenario_start(scenario_module)
+    assert not awm_server_diagnostics._install_atomic_scenario_start(scenario_module)
+    process = FakeScenarioProcess()
+    url = process.start("ignored", str(tmp_path / "db.sqlite"), str(tmp_path))
+
+    assert len(launches) == 2
+    assert url == f"http://127.0.0.1:{process._port}/mcp"
+    assert all("pass_fds" in kwargs and len(kwargs["pass_fds"]) == 1 for _, kwargs in launches)
+    inherited_fd = launches[-1][1]["pass_fds"][0]
+    with pytest.raises(OSError):
+        os.fstat(inherited_fd)
+    server_code = (tmp_path / "server.py").read_text()
+    assert "uvicorn.run(app, fd=" in server_code
+    assert "host='127.0.0.1'" not in server_code

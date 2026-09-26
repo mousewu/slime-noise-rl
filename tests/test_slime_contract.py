@@ -11,7 +11,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from noise_rl import slime_hooks
-from noise_rl.agent import QwenChatProtocol, SGLangAbort, Segment, Trajectory, run_episode
+from noise_rl.agent import QwenChatProtocol, Segment, SGLangAbort, Trajectory, run_episode
 from noise_rl.config import ExperimentConfig, NoiseConfig
 from noise_rl.data import NoiseDataSource, mini_records, write_records
 from noise_rl.fixtures import ByteTokenizer, ScriptedClient
@@ -116,6 +116,71 @@ def test_windowed_converter_counts_original_rollouts_and_actual_train_tokens(mon
     assert data["rollout_mask_sums"] == [2, 2]
     assert reported[0]["train_tokens"] == 8
     assert reported[0]["train/subtrajectories"] == 2
+
+
+def test_windowed_converter_adds_zero_signal_padding_for_actor_dp(monkeypatch):
+    class Status:
+        COMPLETED = "completed"
+        TRUNCATED = "truncated"
+
+    args = SimpleNamespace(
+        noise_rl=ExperimentConfig(history_window=1).to_dict(),
+        n_samples_per_prompt=8,
+        rollout_batch_size=2,
+        over_sampling_batch_size=2,
+        rollout_global_dataset=True,
+        advantage_estimator="grpo",
+        custom_convert_samples_to_train_data_path=(
+            "noise_rl.slime_hooks.convert_samples_to_windowed_train_data"
+        ),
+        rollout_top_p=1.0,
+        actor_num_nodes=1,
+        actor_num_gpus_per_node=6,
+        tensor_model_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+    )
+
+    def sample(index, lengths):
+        return SimpleNamespace(
+            Status=Status,
+            status=Status.COMPLETED,
+            index=index,
+            rollout_id=None,
+            metadata={
+                "windowed_train_sequences": [
+                    {
+                        "tokens": list(range(length + 2)),
+                        "response_length": length,
+                        "loss_mask": [1] * length,
+                        "rollout_log_probs": [-0.1] * length,
+                    }
+                    for length in lengths
+                ]
+            },
+        )
+
+    samples = [sample(10, [1, 2, 3]), sample(11, [2, 3])]
+    monkeypatch.setattr(
+        slime_hooks,
+        "reward_postprocess",
+        lambda _args, _samples: ([1.0, 0.0], [0.5, -0.5]),
+    )
+    reported = []
+    monkeypatch.setattr(slime_hooks, "report_metrics", lambda metrics: reported.append(metrics))
+
+    data = convert_samples_to_windowed_train_data(args, samples)
+
+    assert len(data["tokens"]) == 6  # five real action samples aligned to actor DP=3
+    assert data["rewards"][-1] == data["raw_reward"][-1] == 0.0
+    assert data["truncated"][-1] == 0
+    assert data["loss_masks"][-1] == [0]
+    assert data["rollout_log_probs"][-1] == [0.0]
+    assert data["rollout_ids"][-1] in {10, 11}
+    assert data["rollout_mask_sums"][-1] > 0
+    assert reported[0]["train/subtrajectories"] == 5
+    assert reported[0]["train/action_tokens"] == 11
+    assert reported[0]["train_tokens"] == 21
 
 
 def test_async_hook_marks_sglang_abort_for_full_group_requeue(task, slime_args, monkeypatch):

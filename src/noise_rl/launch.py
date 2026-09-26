@@ -236,6 +236,11 @@ def build_command(args, config, fully_async=False):
         "--attention-backend",
         "flash",
     ]
+    if config.history_window:
+        command += [
+            "--custom-convert-samples-to-train-data-path",
+            "noise_rl.slime_hooks.convert_samples_to_windowed_train_data",
+        ]
     if fully_async:
         command += [
             "--rollout-num-gpus",

@@ -8,7 +8,13 @@ from .advantages import group_advantages
 from .agent import SGLangAbort, SGLangClient, run_episode
 from .config import NoiseConfig, config_from_args
 from .data import atomic_json, read_records
-from .metrics import episode_record, percentile95, summarize, trace_metrics
+from .metrics import (
+    episode_record,
+    is_environment_error_record,
+    percentile95,
+    summarize,
+    trace_metrics,
+)
 from .sampling import SamplingPlan, plan_sample
 from .swanlab_bridge import report_metrics, report_metrics_nonblocking, report_rollout_timing
 
@@ -28,10 +34,19 @@ def validate_slime_args(args):
         "dynamic_sampling_filter_path",
         "rollout_sample_filter_path",
         "custom_advantage_function_path",
-        "custom_convert_samples_to_train_data_path",
     ):
         if getattr(args, option, None):
             raise ValueError(f"{option} would change group membership/advantages; disable it")
+    converter = getattr(args, "custom_convert_samples_to_train_data_path", None)
+    expected_converter = "noise_rl.slime_hooks.convert_samples_to_windowed_train_data"
+    if converter not in {None, expected_converter}:
+        raise ValueError("Only the project-owned history-window converter is supported")
+    if config.history_window and converter != expected_converter:
+        raise ValueError(
+            f"history_window requires --custom-convert-samples-to-train-data-path {expected_converter}"
+        )
+    if not config.history_window and converter:
+        raise ValueError("Disable the history-window converter when history_window=0")
     if getattr(args, "over_sampling_batch_size", args.rollout_batch_size) != args.rollout_batch_size:
         raise ValueError("Set --over-sampling-batch-size equal to --rollout-batch-size for exact budgets")
     if not getattr(args, "rollout_global_dataset", True):
@@ -63,7 +78,116 @@ def fill_sample(args, sample, trajectory):
     if len(sample.tokens) - sample.response_length != len(trajectory.prompt_tokens):
         raise ValueError("Prompt/response boundary changed")
     sample._validate_response_metadata_lengths()
+    if trajectory.history_window:
+        sample.metadata["windowed_train_sequences"] = windowed_train_sequences(
+            trajectory, trajectory.history_window
+        )
     return sample
+
+
+def windowed_train_sequences(trajectory, history_window):
+    """Split one rollout into per-action samples with inference-identical context.
+
+    Each result keeps the initial task/tool prompt, up to ``history_window``
+    completed action-observation pairs, and the current action. Only the
+    current action has a nonzero loss mask. This is the history-aware training
+    construction described by AWM while preserving the original rollout as the
+    GRPO normalization unit.
+    """
+    if type(history_window) is not int or history_window < 1:
+        raise ValueError("history_window must be a positive integer")
+    history = []
+    sequences = []
+    segments = list(trajectory.segments)
+    index = 0
+    while index < len(segments):
+        action = segments[index]
+        if not action.trainable:
+            raise ValueError("Expected every interaction to start with a trainable action")
+        if action.log_probs is None or len(action.log_probs) != len(action.tokens):
+            raise ValueError("Windowed action tokens require aligned rollout log probabilities")
+        prior = history[-history_window:]
+        prior_tokens = [token for interaction in prior for token in interaction]
+        tokens = list(trajectory.prompt_tokens) + prior_tokens + list(action.tokens)
+        response_length = len(prior_tokens) + len(action.tokens)
+        sequences.append(
+            {
+                "tokens": tokens,
+                "response_length": response_length,
+                "loss_mask": [0] * len(prior_tokens) + [1] * len(action.tokens),
+                "rollout_log_probs": [0.0] * len(prior_tokens) + list(action.log_probs),
+            }
+        )
+        index += 1
+        if index < len(segments) and not segments[index].trainable:
+            observation = segments[index]
+            history.append(list(action.tokens) + list(observation.tokens))
+            index += 1
+    if not sequences:
+        raise ValueError("A rollout without trainable actions cannot be windowed")
+    return sequences
+
+
+def convert_samples_to_windowed_train_data(args, samples):
+    """Convert complete rollouts into history-windowed per-action train data."""
+    config = validate_slime_args(args)
+    if not samples or isinstance(samples[0], list):
+        raise ValueError("Expected a flat Sample list before Slime DP sharding")
+    if getattr(args, "rollout_top_p", 1.0) != 1.0:
+        raise ValueError("Windowed training currently requires rollout_top_p=1")
+    raw_rewards, advantages = reward_postprocess(args, samples)
+    data = {
+        "tokens": [],
+        "response_lengths": [],
+        "rewards": [],
+        "raw_reward": [],
+        "truncated": [],
+        "sample_indices": [],
+        "rollout_ids": [],
+        "loss_masks": [],
+        "rollout_log_probs": [],
+    }
+    status_type = samples[0].Status
+    for position, (sample, raw_reward, advantage) in enumerate(
+        zip(samples, raw_rewards, advantages, strict=True)
+    ):
+        sequences = sample.metadata.get("windowed_train_sequences")
+        if not isinstance(sequences, list) or not sequences:
+            raise ValueError("Missing windowed train sequences on completed rollout")
+        rollout_id = sample.rollout_id
+        if rollout_id is None:
+            rollout_id = sample.index if sample.index is not None else position
+        for sequence in sequences:
+            if len(sequence["tokens"]) > config.max_context_tokens:
+                raise ValueError(
+                    "Windowed train sequence exceeds max_context_tokens: "
+                    f"{len(sequence['tokens'])} > {config.max_context_tokens}"
+                )
+            data["tokens"].append(sequence["tokens"])
+            data["response_lengths"].append(sequence["response_length"])
+            data["rewards"].append(advantage)
+            data["raw_reward"].append(raw_reward)
+            data["truncated"].append(1 if sample.status == status_type.TRUNCATED else 0)
+            data["sample_indices"].append(sample.index)
+            data["rollout_ids"].append(rollout_id)
+            data["loss_masks"].append(sequence["loss_mask"])
+            data["rollout_log_probs"].append(sequence["rollout_log_probs"])
+    rollout_mask_totals = {}
+    for rollout_id, mask in zip(data["rollout_ids"], data["loss_masks"], strict=True):
+        rollout_mask_totals[rollout_id] = rollout_mask_totals.get(rollout_id, 0) + sum(mask)
+    data["rollout_mask_sums"] = [rollout_mask_totals[value] for value in data["rollout_ids"]]
+    lengths = [len(tokens) for tokens in data["tokens"]]
+    report_metrics(
+        {
+            "train_tokens": sum(lengths),
+            "train_sequence_length_mean": sum(lengths) / len(lengths),
+            "train_sequence_length_p95": percentile95(lengths),
+            "train/action_tokens": sum(sum(mask) for mask in data["loss_masks"]),
+            "train/subtrajectories": len(lengths),
+            "train/original_rollouts": len(samples),
+        }
+    )
+    return data
 
 
 async def generate(args, sample, sampling_params, evaluation=False):
@@ -160,19 +284,8 @@ def reward_postprocess(args, samples):
                     "advantage_second_moment"
                 ],
                 "rollout/groups": len({plan.group_id for plan in plans}),
-                "train_tokens": sum(record.get("generated_tokens", 0) for record in records),
-                "train_sequence_length_mean": sum(
-                    record.get("context_tokens", 0) for record in records
-                ) / len(records),
-                "train_sequence_length_p95": percentile95(
-                    record.get("context_tokens", 0) for record in records
-                ),
                 "environment_error_rate": sum(
-                    1.0 if record.get("termination") == "environment_terminal" or any(
-                        isinstance(step.get("environment_info"), dict)
-                        and step.get("environment_info", {}).get("awm", {}).get("tool_terminal_failure")
-                        for step in record.get("steps", [])
-                    ) else 0.0 for record in records
+                    float(is_environment_error_record(record)) for record in records
                 ) / len(records),
             }
         )

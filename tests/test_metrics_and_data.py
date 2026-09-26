@@ -172,6 +172,7 @@ def test_trace_metrics_include_awm_submission_and_schema_grounding_signals():
     assert metrics["rollout/awm/tool_terminal_failures/server_error/total"] == 1
     assert metrics["rollout/awm/verifier/others_rate"] == 0.5
     assert metrics["rollout/awm/verifier/complete_rate"] == 0.5
+    assert metrics["rollout/environment_error_rate"] == 0.5
 
 
 @pytest.mark.parametrize("damage", ["seed", "conditions", "missing", "duplicate", "training"])

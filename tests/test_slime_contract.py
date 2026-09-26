@@ -1,6 +1,7 @@
 """Runs against actual upstream Sample implementation, not a replacement dataclass."""
 
 import asyncio
+import copy
 import os
 import sys
 from dataclasses import replace
@@ -10,13 +11,19 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from noise_rl import slime_hooks
-from noise_rl.agent import QwenChatProtocol, SGLangAbort, run_episode
+from noise_rl.agent import QwenChatProtocol, SGLangAbort, Segment, Trajectory, run_episode
 from noise_rl.config import ExperimentConfig, NoiseConfig
 from noise_rl.data import NoiseDataSource, mini_records, write_records
 from noise_rl.fixtures import ByteTokenizer, ScriptedClient
 from noise_rl.launch import model_arguments, verify_slime
 from noise_rl.sampling import plan_sample
-from noise_rl.slime_hooks import fill_sample, reward_postprocess, validate_slime_args
+from noise_rl.slime_hooks import (
+    convert_samples_to_windowed_train_data,
+    fill_sample,
+    reward_postprocess,
+    validate_slime_args,
+    windowed_train_sequences,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -36,6 +43,79 @@ def test_actual_slime_sample_token_alignment(Sample, task, slime_args):
     assert sample.status == Sample.Status.COMPLETED and sample.reward == 1
     assert sample.response_length == len(sample.rollout_log_probs) == len(sample.loss_mask)
     assert all(p == 0 for p, m in zip(sample.rollout_log_probs, sample.loss_mask) if m == 0)
+
+
+def test_history_window_splits_each_action_with_matching_context():
+    trajectory = Trajectory("prompt", [1, 2], history_window=1)
+    trajectory.segments = [
+        Segment([10], [-0.1], "a0", True),
+        Segment([20], None, "o0", False),
+        Segment([11, 12], [-0.2, -0.3], "a1", True),
+        Segment([21], None, "o1", False),
+        Segment([13], [-0.4], "a2", True),
+    ]
+    sequences = windowed_train_sequences(trajectory, 1)
+    assert [row["tokens"] for row in sequences] == [
+        [1, 2, 10],
+        [1, 2, 10, 20, 11, 12],
+        [1, 2, 11, 12, 21, 13],
+    ]
+    assert [row["loss_mask"] for row in sequences] == [
+        [1],
+        [0, 0, 1, 1],
+        [0, 0, 0, 1],
+    ]
+    assert sequences[-1]["rollout_log_probs"] == [0.0, 0.0, 0.0, -0.4]
+
+
+def test_windowed_converter_counts_original_rollouts_and_actual_train_tokens(monkeypatch):
+    class Status:
+        COMPLETED = "completed"
+        TRUNCATED = "truncated"
+
+    args = SimpleNamespace(
+        noise_rl=ExperimentConfig(history_window=1).to_dict(),
+        n_samples_per_prompt=8,
+        rollout_batch_size=1,
+        over_sampling_batch_size=1,
+        rollout_global_dataset=True,
+        advantage_estimator="grpo",
+        custom_convert_samples_to_train_data_path=(
+            "noise_rl.slime_hooks.convert_samples_to_windowed_train_data"
+        ),
+        rollout_top_p=1.0,
+    )
+    sample = SimpleNamespace(
+        Status=Status,
+        status=Status.COMPLETED,
+        index=7,
+        rollout_id=None,
+        metadata={
+            "windowed_train_sequences": [
+                {
+                    "tokens": [1, 2, 3],
+                    "response_length": 1,
+                    "loss_mask": [1],
+                    "rollout_log_probs": [-0.1],
+                },
+                {
+                    "tokens": [1, 2, 3, 4, 5],
+                    "response_length": 3,
+                    "loss_mask": [0, 0, 1],
+                    "rollout_log_probs": [0.0, 0.0, -0.2],
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr(slime_hooks, "reward_postprocess", lambda _args, _samples: ([1.0], [0.5]))
+    reported = []
+    monkeypatch.setattr(slime_hooks, "report_metrics", lambda metrics: reported.append(metrics))
+    data = convert_samples_to_windowed_train_data(args, [sample])
+    assert data["rollout_ids"] == [7, 7]
+    assert data["rewards"] == [0.5, 0.5]
+    assert data["rollout_mask_sums"] == [2, 2]
+    assert reported[0]["train_tokens"] == 8
+    assert reported[0]["train/subtrajectories"] == 2
 
 
 def test_async_hook_marks_sglang_abort_for_full_group_requeue(task, slime_args, monkeypatch):

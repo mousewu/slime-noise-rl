@@ -149,7 +149,9 @@ def test_fully_async_command_is_non_colocated_and_uses_official_rollout(tmp_path
     args.rollout_gpus = 4
     monkeypatch.setattr(launch, "model_arguments", lambda _slime: [])
 
-    command = build_command(args, ExperimentConfig(concurrency=16), fully_async=True)
+    command = build_command(
+        args, ExperimentConfig(concurrency=16, history_window=3), fully_async=True
+    )
 
     def value(key):
         return command[command.index(key) + 1]
@@ -161,6 +163,9 @@ def test_fully_async_command_is_non_colocated_and_uses_official_rollout(tmp_path
         "slime.rollout.fully_async_rollout.generate_rollout_fully_async"
     )
     assert value("--sglang-server-concurrency") == "8"
+    assert value("--custom-convert-samples-to-train-data-path") == (
+        "noise_rl.slime_hooks.convert_samples_to_windowed_train_data"
+    )
     assert "--colocate" not in command
     assert "--eval-function-path" not in command
 

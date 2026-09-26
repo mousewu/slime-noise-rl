@@ -13,6 +13,25 @@ def percentile95(values):
     index = min(len(ordered) - 1, max(0, int(0.95 * len(ordered) + 0.999999) - 1))
     return ordered[index]
 
+
+def is_environment_error_record(record: dict) -> bool:
+    """Whether a completed trace contains an explicit AWM infrastructure error.
+
+    ``environment_terminal`` also covers ordinary verifier outcomes such as
+    ``others``. It is therefore not itself evidence of an environment error.
+    """
+    for step in record.get("steps", []):
+        environment_info = step.get("environment_info")
+        if not isinstance(environment_info, dict):
+            continue
+        awm_info = environment_info.get("awm")
+        if isinstance(awm_info, dict) and (
+            awm_info.get("tool_terminal_failure")
+            or isinstance(awm_info.get("tool_terminal_failure_type"), str)
+        ):
+            return True
+    return False
+
 from .agent import Trajectory
 from .config import ExperimentConfig
 from .sampling import SamplingPlan
@@ -181,18 +200,8 @@ def trace_metrics(
         f"{prefix}/in_flight_episodes_at_start/max": max(
             record.get("in_flight_episodes_at_start", 1) for record in records
         ),
-        f"{prefix}/train_tokens/total": sum(record.get("generated_tokens", 0) for record in records),
-        f"{prefix}/train_tokens/mean": mean(record.get("generated_tokens", 0) for record in records),
-        f"{prefix}/train_sequence_length_mean": mean(record.get("context_tokens", 0) for record in records),
-        f"{prefix}/train_sequence_length_p95": percentile95(
-            record.get("context_tokens", 0) for record in records
-        ),
         f"{prefix}/environment_error_rate": mean(
-            1.0 if record.get("termination") == "environment_terminal" or any(
-                isinstance(step.get("environment_info"), dict)
-                and step.get("environment_info", {}).get("awm", {}).get("tool_terminal_failure")
-                for step in record.get("steps", [])
-            ) else 0.0 for record in records
+            float(is_environment_error_record(record)) for record in records
         ),
         f"{prefix}/faults/action_drop_rate": (
             sum(bool(event.get("dropped")) for event in faults) / len(faults)

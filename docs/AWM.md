@@ -328,6 +328,85 @@ AWM_MODEL_REPLAY_OUTPUT=runs/awm-model-replay-shard1.jsonl \
 bash scripts/replay_awm_tasks_with_model.sh
 ```
 
+### 环境认证流水线（正式 SFT/RL 前）
+
+单次模型回放只能说明“某个策略曾经这样调用过工具”，不能证明任务可解、成功轨迹可重复，也不能证明
+verifier 不会无条件给分。`certify_awm_environment.sh` 将这些问题拆成五个独立门槛：
+
+1. **结构认证**：同一任务在全新 session 中重复 reset，要求 task 文本与完整工具 schema 的 hash 稳定；reset、
+   list-tools 和 code verifier 必须可用。
+2. **witness 认证**：从 clean teacher replay 中选择最短的 `code verifier = complete` 轨迹，在全新数据库 session
+   中精确重放多次，要求每次都成功，且不得出现格式错误、422/500、timeout 或工具 error。
+3. **verifier 反事实认证**：空操作直接 `done` 必须失败；删除一条关键动作或替换 `final_answer` 后也必须失败。
+   这样可排除“无论做什么都 complete”的坏 verifier。
+4. **运行稳定性**：单独读取 clean student replay，要求每题达到指定尝试数，且环境错误和格式错误不超过阈值。
+5. **RL 可学习性**：默认要求 student 至少 16 次 clean 尝试，成功率落在 `[0.125, 0.875]`，即 16 次中约
+   `2–14` 次成功；全失败任务暂时过难，全成功任务没有组内优势信号。
+
+teacher 与 student replay 必须分开：teacher 提供“已知可行”的动作 witness；student 才用于估计当前训练起点的
+难度。两份 replay 都可由 `replay_awm_tasks_with_model.sh` 生成，且必须关闭 action-drop、observation-loss（该脚本
+已经强制关闭）。student replay 应让 SGLang 加载**将用于 RL 初始化的 checkpoint**，每题采样 16 次：
+
+```bash
+# 已有 teacher replay 可直接复用；下面生成当前 student 的 clean 16-shot replay。
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+HF_CHECKPOINT=/models/qwen-awm-sft \
+AWM_URL=http://127.0.0.1:8899 \
+SGLANG_URL=http://127.0.0.1:30000 \
+AWM_MANIFEST=data/awm/train.task-preflight.ctx16k.jsonl \
+AWM_MODEL_REPLAY_REPEATS=16 \
+AWM_MODEL_REPLAY_TEMPERATURE=1.0 \
+AWM_MODEL_REPLAY_CONCURRENCY=8 \
+AWM_MODEL_REPLAY_OUTPUT=runs/awm-student-clean-r16.jsonl \
+bash scripts/replay_awm_tasks_with_model.sh
+```
+
+两份 replay 准备好后运行认证。该阶段只连接 AWM，精确重放已保存的 action；不调用模型、不启动 SGLang、
+Slime/Ray 或反向传播：
+
+```bash
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+AWM_URL=http://127.0.0.1:8899 \
+AWM_MANIFEST=data/awm/train.task-preflight.ctx16k.jsonl \
+AWM_WITNESS_REPLAY=runs/awm-teacher-replay.jsonl \
+AWM_POLICY_REPLAY=runs/awm-student-clean-r16.jsonl \
+AWM_CERTIFIED_ENV_MANIFEST=data/awm/train.environment-certified.jsonl \
+AWM_CERTIFIED_RL_MANIFEST=data/awm/train.rl-certified.jsonl \
+AWM_CERTIFICATION_EVIDENCE=runs/awm-certification.evidence.jsonl \
+AWM_CERTIFICATION_QUARANTINE=runs/awm-certification.quarantine.jsonl \
+AWM_CERTIFICATION_REPORT=runs/awm-certification.report.json \
+AWM_CERTIFICATION_SERVER_REVISION='OpenEnv=<commit>;AWM-data=<sha256-or-release>' \
+AWM_CERTIFICATION_WORKERS=4 \
+bash scripts/certify_awm_environment.sh
+```
+
+认证可能运行较久。每完成一题就会 `fsync` 到 evidence；若进程中断，保持相同输入、阈值和 evidence 路径并设置
+`AWM_CERTIFICATION_RESUME=1` 即可跳过已完成任务。输入文件或阈值发生变化时 fingerprint 不同，脚本会拒绝把
+旧 evidence 混入新认证。最终产物含义如下：
+
+- `train.environment-certified.jsonl`：通过结构、witness 和 verifier 门槛，可用于构建 SFT 数据或进一步分析；
+- `train.rl-certified.jsonl`：还通过 student 运行稳定性与可学习性门槛，正式 RL 的 `AWM_MANIFEST` 应指向此文件；
+- `*.quarantine.jsonl`：逐题记录被隔离原因和 probe 结果；
+- `*.report.json`：记录输入/输出 SHA-256、Git revision、阈值与各门槛计数，作为论文实验的冻结数据证明；
+- `*.evidence.jsonl`：可续跑的逐题原始认证证据。
+
+从 teacher replay 构建 SFT 时，把环境认证 manifest 作为硬 allowlist，避免未通过认证的成功轨迹再次进入 SFT：
+
+```bash
+PYTHON_BIN=/opt/conda/envs/slime-train/bin/python \
+HF_CHECKPOINT=/models/Qwen3-4B-Instruct-2507 \
+AWM_SFT_REPLAY=runs/awm-teacher-replay.jsonl \
+AWM_SFT_TASK_MANIFEST=data/awm/train.environment-certified.jsonl \
+AWM_SFT_OUTPUT=data/awm/train.environment-certified.sft.jsonl \
+AWM_SFT_REPORT=data/awm/train.environment-certified.sft.report.json \
+bash scripts/build_awm_sft_data.sh
+```
+
+默认 observation hash 只记录、不作硬门槛，因为部分合法工具可能返回动态时间或 ID。如已确认环境应逐字确定，
+可设置 `AWM_CERTIFICATION_REQUIRE_DETERMINISTIC_OBSERVATIONS=1`。公开 trainer harness 不暴露 SQLite 原始 diff，
+因此本流水线用“全新 session 的重复 code-verifier 结果 + observation hash + 反事实失败”替代 DB diff；报告会明确
+记录这一限制。
+
 ### 从已验证成功 replay 构建 action-only SFT 数据
 
 固定策略 replay 中的成功轨迹可作为 AWM 的 SFT warm start。已有

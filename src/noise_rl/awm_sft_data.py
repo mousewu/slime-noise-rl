@@ -29,6 +29,7 @@ from typing import Any, Callable, Iterable
 from .agent import QwenChatProtocol
 from .awm import AWMEnvironment, SYSTEM_PROMPT, canonical_action
 from .awm_context import load_local_tokenizer
+from .data import read_records
 
 AWM_SFT_SCHEMA_VERSION = 1
 AWM_SFT_DATASET = "awm_verified_replay_sft"
@@ -102,7 +103,9 @@ def _step_actions(row: dict[str, Any], *, max_actions: int) -> list[tuple[str, s
     steps = row.get("steps")
     if not isinstance(steps, list) or not steps:
         raise ValueError("successful trajectory has no steps")
-    if row.get("format_errors") != 0:
+    # Older replay rows did not persist the aggregate field; the per-step
+    # checks below remain authoritative for those rows.
+    if int(row.get("format_errors", 0) or 0) != 0:
         raise ValueError("trajectory contains one or more format errors")
     if len(steps) > max_actions:
         raise ValueError(f"trajectory has more than max_actions={max_actions} actions")
@@ -361,6 +364,7 @@ def build_awm_sft_dataset(
     rehydrate_timeout: float = 180,
     prompt_audit: Callable[[dict[str, Any], str], None] | None = None,
     initial_observation_resolver: Callable[[dict[str, Any]], str] | None = None,
+    task_manifest: str | Path | None = None,
     strict: bool = False,
 ) -> dict[str, Any]:
     """Create a non-overwriting, prompt-audited AWM SFT JSONL and report."""
@@ -382,6 +386,17 @@ def build_awm_sft_dataset(
     if output_path.exists() or report_path.exists():
         raise FileExistsError("AWM SFT output or report already exists; choose new paths")
 
+    task_manifest_path: Path | None = None
+    allowed_task_ids: set[str] | None = None
+    if task_manifest is not None:
+        task_manifest_path = Path(task_manifest).expanduser().resolve(strict=True)
+        allowed_task_ids = set()
+        for record in read_records(task_manifest_path):
+            manifest_task = record["metadata"]["task"]
+            if manifest_task.get("environment") != "awm" or manifest_task.get("split") != "train":
+                raise ValueError("SFT task allowlist must be a train-only AWM manifest")
+            allowed_task_ids.add(manifest_task["id"])
+
     replay_sha256 = _sha256(replay_path)
     candidates: list[tuple[tuple[Any, ...], int, dict[str, Any], dict[str, Any], list[tuple[str, str]]]] = []
     rejected: Counter[str] = Counter()
@@ -397,6 +412,8 @@ def build_awm_sft_dataset(
                 if not isinstance(row, dict):
                     raise ValueError("row is not a JSON object")
                 task = _validate_source_row(row)
+                if allowed_task_ids is not None and task["id"] not in allowed_task_ids:
+                    raise ValueError("task is not present in the certified task manifest")
                 actions = _step_actions(row, max_actions=max_actions)
                 # Prefer concise demonstrated solutions when a replay has repeats.
                 rank = (len(actions), int(row.get("generated_tokens", 10**12)), task["id"], line_number)
@@ -406,6 +423,8 @@ def build_awm_sft_dataset(
                 rejected[reason] += 1
                 if len(rejected_examples) < 30:
                     rejected_examples.append({"line": line_number, "reason": reason})
+    if not candidates:
+        raise ValueError("No clean code-verifier-successful AWM replay trajectories were found")
     selected: list[tuple[int, dict[str, Any], dict[str, Any], list[tuple[str, str]]]] = []
     per_task = Counter()
     per_scenario = Counter()
@@ -451,19 +470,10 @@ def build_awm_sft_dataset(
                 rejected_examples.append({"line": line_number, "task_id": task["id"], "reason": reason})
             if strict:
                 raise ValueError(f"Rejected source replay line {line_number}: {reason}") from exc
+    if not rows:
+        raise ValueError("No clean prompt-compatible AWM SFT records were produced")
     _write_rows(output_path, rows)
-    if rows:
-        facts = validate_awm_sft_records(output_path)
-    else:
-        facts = {
-            "path": str(output_path),
-            "sha256": _sha256(output_path),
-            "dataset": AWM_SFT_DATASET,
-            "records": 0,
-            "expert_actions": 0,
-            "unique_tasks": 0,
-            "unique_scenarios": 0,
-        }
+    facts = validate_awm_sft_records(output_path)
     counts = [row["metadata"]["action_count"] for row in rows]
     scenario_counts = Counter(row["metadata"]["scenario"] for row in rows)
     business_tools = Counter()
@@ -479,6 +489,8 @@ def build_awm_sft_dataset(
         "dataset": AWM_SFT_DATASET,
         "replay": str(replay_path),
         "replay_sha256": replay_sha256,
+        "task_manifest": str(task_manifest_path) if task_manifest_path else None,
+        "task_manifest_sha256": _sha256(task_manifest_path) if task_manifest_path else None,
         "source_rows": source_rows,
         "clean_code_verifier_success_candidates": len(candidates),
         "selected_after_caps": len(selected),
@@ -519,6 +531,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--report", required=True, help="New data-quality JSON report")
     parser.add_argument("--hf-checkpoint", required=True, help="Local Qwen tokenizer/checkpoint used in replay")
     parser.add_argument("--awm-url", help="Required only to rehydrate legacy replays without initial_observation")
+    parser.add_argument(
+        "--task-manifest",
+        help="optional train-only certified AWM manifest used as a strict task allowlist",
+    )
     parser.add_argument("--rehydrate-timeout", type=float, default=180)
     parser.add_argument("--max-actions", type=int, default=40)
     parser.add_argument("--max-per-task", type=int, default=1)
@@ -538,6 +554,7 @@ def main(argv: list[str] | None = None) -> None:
         max_per_task=args.max_per_task,
         max_per_scenario=args.max_per_scenario,
         awm_url=args.awm_url,
+        task_manifest=args.task_manifest,
         rehydrate_timeout=args.rehydrate_timeout,
         prompt_audit=make_prompt_auditor(tokenizer),
         strict=args.strict,

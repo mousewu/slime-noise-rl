@@ -49,6 +49,13 @@ TASK_ARGS=(
 if [[ -n "${AWM_SFT_AWM_URL:-}" ]]; then
   TASK_ARGS+=(--awm-url "${AWM_SFT_AWM_URL}")
 fi
+if [[ -n "${AWM_SFT_TASK_MANIFEST:-}" ]]; then
+  [[ -f "${AWM_SFT_TASK_MANIFEST}" ]] || {
+    echo "AWM_SFT_TASK_MANIFEST must be an existing certified manifest" >&2
+    exit 2
+  }
+  TASK_ARGS+=(--task-manifest "${AWM_SFT_TASK_MANIFEST}")
+fi
 if [[ "${AWM_SFT_STRICT:-0}" == "1" ]]; then
   TASK_ARGS+=(--strict)
 fi

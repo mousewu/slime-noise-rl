@@ -9,6 +9,7 @@ from noise_rl.awm_sft_data import (
     build_awm_sft_dataset,
     validate_awm_sft_records,
 )
+from noise_rl.data import write_records
 from noise_rl.sft_launch import validate_sft_input
 
 
@@ -176,3 +177,44 @@ def test_builder_limits_duplicate_task_to_shortest_success(tmp_path):
     assert value["rejected"]["per_task_cap"] == 1
     row = json.loads(output.read_text(encoding="utf-8"))
     assert row["metadata"]["action_count"] == 2
+
+
+def test_builder_uses_certified_manifest_as_a_strict_task_allowlist(tmp_path):
+    replay = tmp_path / "replay.jsonl"
+    output = tmp_path / "certified-sft.jsonl"
+    report = tmp_path / "certified-sft.report.json"
+    manifest = tmp_path / "certified.jsonl"
+    allowed = _success_row(task_id="awm/schedule/allowed")
+    rejected = _success_row(task_id="awm/schedule/rejected")
+    _write_replay(replay, [allowed, rejected])
+    write_records(
+        manifest,
+        [
+            {
+                "prompt": "Complete the tool-use task.",
+                "metadata": {
+                    "task": {
+                        "id": "awm/schedule/allowed",
+                        "environment": "awm",
+                        "split": "train",
+                        "scenario": "schedule",
+                        "task_idx": 0,
+                        "read_only_tools": [],
+                    }
+                },
+            }
+        ],
+    )
+
+    value = build_awm_sft_dataset(
+        replay,
+        output,
+        report,
+        prompt_audit=_accept_prompt,
+        task_manifest=manifest,
+    )
+
+    row = json.loads(output.read_text(encoding="utf-8"))
+    assert value["records"] == 1
+    assert value["rejected"] == {"task is not present in the certified task manifest": 1}
+    assert row["metadata"]["task_id"] == "awm/schedule/allowed"

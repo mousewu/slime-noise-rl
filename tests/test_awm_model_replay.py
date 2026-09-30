@@ -1,3 +1,4 @@
+import asyncio
 import json
 from copy import deepcopy
 
@@ -129,3 +130,55 @@ def test_model_replay_uses_stable_disjoint_shards():
     right_ids = {row["metadata"]["task"]["id"] for row in right}
     assert not left_ids.intersection(right_ids)
     assert left_ids.union(right_ids) == {row["metadata"]["task"]["id"] for row in records}
+
+
+def test_model_replay_replaces_fast_episode_without_waiting_for_slow_tail(tmp_path):
+    records = []
+    for task_idx in range(3):
+        record = deepcopy(_record())
+        record["metadata"]["task"]["id"] = f"awm/payroll/{task_idx}"
+        record["metadata"]["task"]["task_idx"] = task_idx
+        records.append(record)
+    manifest = tmp_path / "awm.jsonl"
+    output = tmp_path / "rolling.jsonl"
+    write_records(manifest, records)
+    release_slow = asyncio.Event()
+    started = []
+
+    async def runner(task, *_args):
+        task_idx = task["task_idx"]
+        started.append(task_idx)
+        if task_idx == 0:
+            await asyncio.wait_for(release_slow.wait(), timeout=1)
+        elif task_idx == 2:
+            # This third task can start only if completion of task 1 refills
+            # the pool without waiting for the slow task 0.
+            release_slow.set()
+        trajectory = Trajectory(
+            "prompt",
+            [1],
+            initial_observation='{"task":"test","tools":[]}',
+            environment="awm",
+            termination="environment_terminal",
+        )
+        trajectory.elapsed_seconds = 0.01
+        return trajectory
+
+    report = run_model_replay(
+        manifest,
+        output,
+        config=ExperimentConfig(noise=NoiseConfig()),
+        model=None,
+        url="http://sglang.invalid",
+        awm_url="http://awm.invalid",
+        repeats=1,
+        concurrency=2,
+        tokenizer=ByteTokenizer(),
+        client_factory=_Client,
+        episode_runner=runner,
+    )
+
+    assert sorted(started) == [0, 1, 2]
+    assert report["scheduler"] == "rolling"
+    assert report["peak_in_flight"] == 2
+    assert report["attempts_completed"] == 3

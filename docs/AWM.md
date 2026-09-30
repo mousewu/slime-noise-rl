@@ -328,6 +328,38 @@ AWM_MODEL_REPLAY_OUTPUT=runs/awm-model-replay-shard1.jsonl \
 bash scripts/replay_awm_tasks_with_model.sh
 ```
 
+### 两张 GPU 的高利用率回放
+
+4B 模型在 A100 80GB 上不需要 TP=2。单个 TP=2 engine 会让两张卡共同处理同一批短 JSON action，既增加
+通信，又会在 agent 等待 AWM 工具和数据库时一起空闲。`replay_awm_2gpu.sh` 在两张卡上各启动一个 TP=1
+SGLang replica，并自动完成稳定分片、并行回放、结果合并、进程清理和 5 秒间隔 GPU 利用率记录：
+
+```bash
+# AWM 服务需已在隔离环境中启动；本脚本会自行启动两个 SGLang server。
+PYTHON_BIN=/opt/conda/bin/python \
+SGLANG_PYTHON_BIN=/opt/conda/bin/python \
+HF_CHECKPOINT=/models/qwen-awm-sft-hf \
+AWM_MANIFEST=data/awm/train.task-preflight.ctx16k.jsonl \
+AWM_URL=http://127.0.0.1:8899 \
+AWM_MODEL_REPLAY_REPEATS=16 \
+AWM_MODEL_REPLAY_TEMPERATURE=1.0 \
+AWM_REPLAY_CONCURRENCY_PER_GPU=32 \
+AWM_DUAL_REPLAY_OUTPUT=runs/awm-student-clean-r16.jsonl \
+bash scripts/replay_awm_2gpu.sh
+```
+
+输出 `awm-student-clean-r16.jsonl` 已合并两个互斥 shard，可直接传给认证器；每个 shard 的原始 JSONL、summary
+和 incidents 仍会保留。两个 SGLang 日志及 `gpu-utilization.csv` 位于同名 `.logs/` 目录，脚本结束时还会打印
+每张 GPU 和两卡平均利用率。
+
+回放调度器使用 rolling concurrency：任一 episode 完成后立即补入下一个，不再等待同批最慢轨迹；16 次重复按
+repeat 外层、task 内层交错，避免同一坏任务连续占满全部 in-flight slot。并发建议按每卡 `32 → 48 → 64`
+递增；若 AWM 的 500/timeout、CPU、内存或临时目录压力明显增加，应退回上一档，而不是继续提高。
+
+如果平台允许**只申请一张 GPU**，单卡 TP=1 也比“两卡作业只使用其中一张”更容易通过平均利用率门槛；后者即使
+GPU 0 为 100%、GPU 1 为 0%，两卡平均也只有 50%。单卡吞吐通常低于两个 TP=1 replica，且仍需将 episode
+并发提高到 32–64。若平台固定分配两张卡，应优先使用上述双 replica 脚本。
+
 ### 环境认证流水线（正式 SFT/RL 前）
 
 单次模型回放只能说明“某个策略曾经这样调用过工具”，不能证明任务可解、成功轨迹可重复，也不能证明

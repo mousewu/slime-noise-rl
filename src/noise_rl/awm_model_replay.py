@@ -301,13 +301,20 @@ async def _replay_attempts(
     summary_output: Path,
     episode_runner: Callable[..., Any],
 ) -> dict[str, Any]:
-    """Run bounded batches and stream durable rows after every completed batch."""
+    """Keep a rolling set of episodes in flight and stream durable results.
+
+    A fixed ``gather`` batch lets one long-tail agent episode drain the entire
+    SGLang batch before any replacement work is submitted.  The rolling pool
+    immediately replaces each completed episode, so the configured
+    concurrency is maintained until the final tail of the replay.
+    """
     candidates: dict[tuple[str, int, str, str], dict[str, Any]] = {}
     status_counts: Counter[str] = Counter()
     termination_counts: Counter[str] = Counter()
     exception_counts: Counter[str] = Counter()
     failure_type_counts: Counter[str] = Counter()
     successful = completed = generated_tokens = tool_calls = 0
+    peak_in_flight = 0
     elapsed: list[float] = []
 
     async def one(index: int, record: dict[str, Any], attempt: int) -> dict[str, Any]:
@@ -328,11 +335,27 @@ async def _replay_attempts(
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x", encoding="utf-8") as stream:
-        batch_size = config.concurrency
-        for start in range(0, len(attempts), batch_size):
-            batch = attempts[start : start + batch_size]
-            rows = await asyncio.gather(*(one(*item) for item in batch))
-            for row in rows:
+        remaining = iter(attempts)
+        pending: set[asyncio.Task] = set()
+
+        def refill() -> None:
+            nonlocal peak_in_flight
+            while len(pending) < config.concurrency:
+                try:
+                    item = next(remaining)
+                except StopIteration:
+                    break
+                pending.add(asyncio.create_task(one(*item)))
+            peak_in_flight = max(peak_in_flight, len(pending))
+
+        refill()
+        durable_completed = 0
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                row = task.result()
                 stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n")
                 completed += 1
                 status = str(row["status"])
@@ -349,15 +372,19 @@ async def _replay_attempts(
                 for candidate in _terminal_failure_candidates(row):
                     failure_type_counts[candidate["failure_type"]] += 1
                     _accumulate_candidate(candidates, candidate, replay_output=output)
-            stream.flush()
-            os.fsync(stream.fileno())
-            print(
-                f"AWM model replay: {completed}/{len(attempts)} attempts; "
-                f"terminal-tool-failures={sum(failure_type_counts.values())}; "
-                f"candidates={len(candidates)}",
-                file=sys.stderr,
-                flush=True,
-            )
+            refill()
+            if completed - durable_completed >= config.concurrency or not pending:
+                stream.flush()
+                os.fsync(stream.fileno())
+                durable_completed = completed
+                print(
+                    f"AWM model replay: {completed}/{len(attempts)} attempts; "
+                    f"in-flight={len(pending)}; "
+                    f"terminal-tool-failures={sum(failure_type_counts.values())}; "
+                    f"candidates={len(candidates)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     incident_output.parent.mkdir(parents=True, exist_ok=True)
     with incident_output.open("x", encoding="utf-8") as stream:
@@ -375,6 +402,8 @@ async def _replay_attempts(
         "tasks": len(tasks),
         "attempts_requested": len(attempts),
         "attempts_completed": completed,
+        "scheduler": "rolling",
+        "peak_in_flight": peak_in_flight,
         "successes": successful,
         "success_rate": successful / completed if completed else 0.0,
         "status_counts": dict(sorted(status_counts.items())),
@@ -461,10 +490,13 @@ def run_model_replay(
     )
     tokenizer = tokenizer or load_local_tokenizer(model)
     checkpoint = str(Path(model).expanduser().resolve()) if model else "injected-tokenizer"
+    # Interleave tasks before repeats.  Adjacent attempts therefore exercise
+    # different scenarios instead of sending every repeat of one pathological
+    # task to the same inference batch.
     attempts = [
         (index, record, attempt)
-        for index, record in enumerate(selected)
         for attempt in range(repeats)
+        for index, record in enumerate(selected)
     ]
 
     async def execute() -> dict[str, Any]:

@@ -360,6 +360,30 @@ repeat 外层、task 内层交错，避免同一坏任务连续占满全部 in-f
 GPU 0 为 100%、GPU 1 为 0%，两卡平均也只有 50%。单卡吞吐通常低于两个 TP=1 replica，且仍需将 episode
 并发提高到 32–64。若平台固定分配两张卡，应优先使用上述双 replica 脚本。
 
+### 四张 GPU、四分片回放
+
+`replay_awm_4gpu.sh` 将相同的调度方式扩展为四个独立 TP=1 SGLang replica 和四个稳定、互斥的任务分片。
+脚本统一负责模型服务启动、分片回放、失败清理、结果与 incident 合并以及四卡利用率采样；四个分片共享一个
+预先启动的 AWM 服务，不需要启动四份 AWM。默认端口为 `30000`–`30003`：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+PYTHON_BIN=/opt/conda/bin/python \
+SGLANG_PYTHON_BIN=/opt/conda/bin/python \
+HF_CHECKPOINT=/models/qwen-awm-sft-hf \
+AWM_MANIFEST=data/awm/train.task-preflight.ctx16k.jsonl \
+AWM_URL=http://127.0.0.1:8899 \
+AWM_MODEL_REPLAY_REPEATS=16 \
+AWM_REPLAY_CONCURRENCY_PER_GPU=24 \
+AWM_QUAD_REPLAY_OUTPUT=runs/awm-student-clean-r16-4gpu.jsonl \
+bash scripts/replay_awm_4gpu.sh
+```
+
+`AWM_MODEL_REPLAY_TASKS` 仍是**每个分片**的上限；例如设为 32 时，四个分片最多共运行 128 个任务，适合先做
+短时利用率试跑。每卡并发 24 表示 AWM 侧最多同时承受约 96 条在途轨迹。先确认 422/500、ConnectError、
+CPU 和内存稳定，再将每卡并发逐步从 24 提高到 32、48；若环境错误率随并发上升，应降低并发，而不是继续给
+SGLang 加压。最终文件、四个 shard、合并 summary、incident 和 `gpu-utilization.csv` 都保存在输出文件同名前缀下。
+
 ### 环境认证流水线（正式 SFT/RL 前）
 
 单次模型回放只能说明“某个策略曾经这样调用过工具”，不能证明任务可解、成功轨迹可重复，也不能证明

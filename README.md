@@ -440,6 +440,34 @@ noise-rl compare runs/independent-eval.jsonl runs/matched-eval.jsonl
 
 `--model` 提供与已部署权重匹配的 tokenizer 路径，不能替你自动切换服务端权重；请为每次部署记录 checkpoint。所有待比较模型使用同一个评测config、任务顺序、seed、重复数与harness。评测不使用训练时的共享故障情景；训练种子变化也不会改变默认评测种子。`--clean` 测干净环境；未见强度/相关故障需单独评测config。
 
+### AWM 三 checkpoint 独立评测
+
+先从认证流水线的两个冻结 manifest 构造无泄漏评测协议：
+
+```bash
+AWM_ENV_CERTIFIED_MANIFEST=data/awm/train.environment-certified.jsonl \
+AWM_RL_CERTIFIED_MANIFEST=data/awm/train.rl-certified.jsonl \
+AWM_EVAL_PROTOCOL_DIR=data/awm/eval-certified128 \
+bash scripts/build_awm_eval_protocol.sh
+```
+
+产物包含：未进入 RL 的 environment-certified 任务、整个 scenario 未进入 RL 的严格子集、用于不同采样 seed 重测的 128 个训练任务，以及去重后的 replay union。AWM 的初始数据库由每条轨迹的新 session 重置；当前数据不提供随机初始数据库，因此“同任务变化”通过独立 policy seed 和 fresh session 实现。
+
+将约 step 1000、step 2000 和最终 Megatron actor 分别转换成三个本地 HF 目录，然后在只暴露两张 GPU、AWM 服务已启动的终端运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+AWM_URL=http://127.0.0.1:8899 \
+AWM_EVAL_PROTOCOL_DIR=data/awm/eval-certified128 \
+EVAL_CHECKPOINT_1000=/path/to/hf-step1000 \
+EVAL_CHECKPOINT_2000=/path/to/hf-step2000 \
+EVAL_CHECKPOINT_FINAL=/path/to/hf-final \
+AWM_CHECKPOINT_EVAL_REPEATS=4 \
+bash scripts/evaluate_awm_checkpoints_2gpu.sh
+```
+
+脚本按 checkpoint 依次启动两份 TP=1 SGLang，使用完全相同的 union manifest；不会训练或下载。最终输出 `summary.tsv` 和 `summary.json`，给出三个集合的 task-macro 成功率、按任务 bootstrap 95% CI、环境错误率与格式错误率。不要直接把训练 step 当作 Megatron iteration；先根据训练日志/checkpoint 映射选择最接近的三个真实 actor checkpoint。
+
 `compare` 检查任务/重复/种子/预算与故障条件一致，并按任务做配对bootstrap。该置信区间不能替代多个训练种子。推理输入token统计是每次请求的完整输入长度之和，包含可能命中缓存的token，不等于实际FLOPs。
 
 ## 8. 研究边界

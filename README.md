@@ -468,6 +468,23 @@ bash scripts/evaluate_awm_checkpoints_2gpu.sh
 
 脚本按 checkpoint 依次启动两份 TP=1 SGLang，使用完全相同的 union manifest；不会训练或下载。最终输出 `summary.tsv` 和 `summary.json`，给出三个集合的 task-macro 成功率、按任务 bootstrap 95% CI、环境错误率与格式错误率。不要直接把训练 step 当作 Megatron iteration；先根据训练日志/checkpoint 映射选择最接近的三个真实 actor checkpoint。
 
+如果服务器按平均 GPU 利用率计费或强制回收，可将请求集中到一张 A100。下面的脚本依次评测 rollout 100、200、300 对应的 HF 模型，默认维持 96 条 in-flight agent 轨迹；这才是 agentic inference 的有效 batch 压力，训练参数 `global_batch_size` 对独立评测无效：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+AWM_URL=http://127.0.0.1:8899 \
+AWM_EVAL_PROTOCOL_DIR=data/awm/eval-certified128 \
+EVAL_CHECKPOINT_ROLLOUT_100=/path/to/hf-rollout-100 \
+EVAL_CHECKPOINT_ROLLOUT_200=/path/to/hf-rollout-200 \
+EVAL_CHECKPOINT_ROLLOUT_300=/path/to/hf-rollout-300 \
+AWM_REPLAY_CONCURRENCY_PER_GPU=96 \
+AWM_CHECKPOINT_EVAL_REPEATS=4 \
+AWM_CHECKPOINT_EVAL_OUTPUT=runs/awm-rollout-100-200-300-eval \
+bash scripts/evaluate_awm_rollouts_1gpu.sh
+```
+
+每个模型目录下的 `logs/gpu-utilization.csv` 只监控这一张物理 GPU；任务结束时会打印平均利用率、达到 70% 的采样占比、峰值和平均显存占比。若 AWM 的 422/500/timeout 明显增加，应将并发从 96 降到 64，而不是继续增大。
+
 `compare` 检查任务/重复/种子/预算与故障条件一致，并按任务做配对bootstrap。该置信区间不能替代多个训练种子。推理输入token统计是每次请求的完整输入长度之和，包含可能命中缓存的token，不等于实际FLOPs。
 
 ## 8. 研究边界

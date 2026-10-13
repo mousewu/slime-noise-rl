@@ -485,6 +485,23 @@ bash scripts/evaluate_awm_rollouts_1gpu.sh
 
 每个模型目录下的 `logs/gpu-utilization.csv` 只监控这一张物理 GPU；任务结束时会打印平均利用率、达到 70% 的采样占比、峰值和平均显存占比。若 AWM 的 422/500/timeout 明显增加，应将并发从 96 降到 64，而不是继续增大。
 
+完成上述三个 RL checkpoint 后，可只补测最终 SFT checkpoint，无需重新运行 rollout 100/200/300。脚本会先验证既有结果的 manifest SHA256、重复数、seed、temperature 和所有 rollout budget，再运行 SFT 并生成四模型汇总：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+AWM_URL=http://127.0.0.1:8899 \
+AWM_EVAL_PROTOCOL_DIR=data/awm/eval-certified128 \
+EVAL_CHECKPOINT_SFT=/path/to/final-sft-hf \
+AWM_EXISTING_ROLLOUT_EVAL_DIR=runs/awm-rollout-100-200-300-eval \
+AWM_REPLAY_CONCURRENCY_PER_GPU=96 \
+AWM_CHECKPOINT_EVAL_REPEATS=4 \
+AWM_CHECKPOINT_EVAL_SEED=20261011 \
+AWM_CHECKPOINT_EVAL_TEMPERATURE=0.8 \
+bash scripts/evaluate_awm_sft_baseline_1gpu.sh
+```
+
+结果写入原评测目录下的 `summary-with-sft.tsv` 和 `summary-with-sft.json`，原来的三模型 `summary.*` 不会被覆盖。
+
 `compare` 检查任务/重复/种子/预算与故障条件一致，并按任务做配对bootstrap。该置信区间不能替代多个训练种子。推理输入token统计是每次请求的完整输入长度之和，包含可能命中缓存的token，不等于实际FLOPs。
 
 ## 8. 研究边界

@@ -136,6 +136,24 @@ def test_steps_per_rollout_requires_an_even_rollout_sample_count(tmp_path, monke
         build_command(args, ExperimentConfig())
 
 
+def test_high_util_colocate_topology_uses_eight_tp1_rollout_engines(tmp_path, monkeypatch):
+    args = options(tmp_path)
+    args.engine_gpus = 1
+    args.batch_size = 16
+    monkeypatch.setattr(launch, "model_arguments", lambda _slime: [])
+
+    command = build_command(args, ExperimentConfig(concurrency=128))
+
+    def value(key):
+        return command[command.index(key) + 1]
+
+    assert "--colocate" in command
+    assert value("--actor-num-gpus-per-node") == "8"
+    assert value("--rollout-num-gpus-per-engine") == "1"
+    assert value("--sglang-server-concurrency") == "16"
+    assert value("--global-batch-size") == "128"
+
+
 def test_invalid_parallelism_rejected_before_launch(tmp_path):
     args = options(tmp_path)
     args.gpus = 7

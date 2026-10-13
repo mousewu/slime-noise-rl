@@ -347,6 +347,16 @@ def main(argv=None, fully_async=False):
         type=int,
         help="Override noise_rl.environment_workers without changing the base YAML",
     )
+    parser.add_argument(
+        "--environment-processes",
+        type=int,
+        help="Override the number of process-isolated ALFWorld runners (0 disables them)",
+    )
+    parser.add_argument(
+        "--environment-recycle-episodes",
+        type=int,
+        help="Override how many leases an ALFWorld runner serves before recycling (0 disables recycling)",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--use-swanlab", action="store_true")
     parser.add_argument("--swanlab-project", default="slime-noise-rl")
@@ -396,7 +406,14 @@ def main(argv=None, fully_async=False):
         "seed": args.seed,
         "trace_dir": str(Path(args.output).expanduser().resolve() / "traces"),
     }
-    for key in ("max_context_tokens", "history_window", "concurrency", "environment_workers"):
+    for key in (
+        "max_context_tokens",
+        "history_window",
+        "concurrency",
+        "environment_workers",
+        "environment_processes",
+        "environment_recycle_episodes",
+    ):
         value = getattr(args, key)
         if value is not None:
             overrides[key] = value

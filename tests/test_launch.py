@@ -24,6 +24,7 @@ def options(tmp_path):
         gpus=8,
         tensor_parallel=2,
         engine_gpus=2,
+        sglang_mem_fraction_static=0.55,
         batch_size=16,
         num_steps_per_rollout=1,
         hf_checkpoint="/models/hf",
@@ -152,6 +153,16 @@ def test_high_util_colocate_topology_uses_eight_tp1_rollout_engines(tmp_path, mo
     assert value("--rollout-num-gpus-per-engine") == "1"
     assert value("--sglang-server-concurrency") == "16"
     assert value("--global-batch-size") == "128"
+
+
+def test_sglang_memory_fraction_is_forwarded(tmp_path, monkeypatch):
+    args = options(tmp_path)
+    args.sglang_mem_fraction_static = 0.65
+    monkeypatch.setattr(launch, "model_arguments", lambda _slime: [])
+
+    command = build_command(args, ExperimentConfig())
+
+    assert command[command.index("--sglang-mem-fraction-static") + 1] == "0.65"
 
 
 def test_invalid_parallelism_rejected_before_launch(tmp_path):

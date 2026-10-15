@@ -28,6 +28,7 @@ TASK_NUM_ROLLOUT="${NUM_ROLLOUT:-300}"
 TASK_SAVE_INTERVAL="${SAVE_INTERVAL:-25}"
 TASK_MAX_CONTEXT="${MAX_CONTEXT_TOKENS:-8192}"
 TASK_MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"
+TASK_SGLANG_MEM_FRACTION="${SGLANG_MEM_FRACTION_STATIC:-0.55}"
 TASK_LR="${LR:-1e-6}"
 TASK_RUN_NAME="${RUN_NAME:-alfworld-matched-loo-async8-tp1-c${TASK_CONCURRENCY}-s${TASK_SEED}}"
 TASK_OUTPUT="${OUTPUT_DIR:-${TASK_PROJECT_DIR}/runs/${TASK_RUN_NAME}}"
@@ -53,8 +54,14 @@ fi
 export PYTHONPATH="${TASK_PROJECT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 
-"${TASK_PYTHON_BIN}" - <<'PY'
+"${TASK_PYTHON_BIN}" - "${TASK_SGLANG_MEM_FRACTION}" <<'PY'
+import sys
+
 import torch
+
+mem_fraction = float(sys.argv[1])
+if not 0 < mem_fraction < 1:
+    raise SystemExit(f"SGLANG_MEM_FRACTION_STATIC must be between 0 and 1, found {mem_fraction}")
 
 count = torch.cuda.device_count()
 if count != 8:
@@ -123,6 +130,7 @@ TASK_ARGS=(
   --save-interval "${TASK_SAVE_INTERVAL}"
   --max-context-tokens "${TASK_MAX_CONTEXT}"
   --max-tokens-per-gpu "${TASK_MAX_TOKENS_PER_GPU}"
+  --sglang-mem-fraction-static "${TASK_SGLANG_MEM_FRACTION}"
   --concurrency "${TASK_CONCURRENCY}"
   --environment-processes "${TASK_ENV_PROCESSES}"
   --environment-recycle-episodes "${TASK_ENV_RECYCLE}"
@@ -143,5 +151,5 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
 fi
 
 echo "Starting ALFWorld fully-async training: batch=${TASK_BATCH_SIZE}, trajectories=$((TASK_BATCH_SIZE * 8)), concurrency=${TASK_CONCURRENCY}"
-echo "Topology: actor=2 GPUs (TP=2); rollout=6 independent TP=1 engines; environment_processes=${TASK_ENV_PROCESSES}"
+echo "Topology: actor=2 GPUs (TP=2); rollout=6 independent TP=1 engines; environment_processes=${TASK_ENV_PROCESSES}; sglang_mem_fraction_static=${TASK_SGLANG_MEM_FRACTION}"
 bash "${TASK_PROJECT_DIR}/scripts/train_fully_async.sh" "${TASK_ARGS[@]}"

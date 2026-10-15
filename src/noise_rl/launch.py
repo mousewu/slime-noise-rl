@@ -221,7 +221,7 @@ def build_command(args, config, fully_async=False):
         "--sglang-server-concurrency",
         str(max(1, config.concurrency // (rollout_gpus // args.engine_gpus))),
         "--sglang-mem-fraction-static",
-        "0.55",
+        str(getattr(args, "sglang_mem_fraction_static", 0.55)),
         "--sglang-attention-backend",
         "flashinfer",
         "--sglang-context-length",
@@ -311,6 +311,12 @@ def main(argv=None, fully_async=False):
         )
     parser.add_argument("--tensor-parallel", type=int, default=2)
     parser.add_argument("--engine-gpus", type=int, default=2)
+    parser.add_argument(
+        "--sglang-mem-fraction-static",
+        type=float,
+        default=0.55,
+        help="Fraction of each rollout GPU reserved by SGLang for model weights and KV cache",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument(
         "--num-steps-per-rollout",
@@ -402,6 +408,8 @@ def main(argv=None, fully_async=False):
             parser.error(f"{key} must be positive")
     if args.lr <= 0:
         parser.error("lr must be positive")
+    if not 0 < args.sglang_mem_fraction_static < 1:
+        parser.error("sglang-mem-fraction-static must be between 0 and 1")
     overrides = {
         "seed": args.seed,
         "trace_dir": str(Path(args.output).expanduser().resolve() / "traces"),

@@ -34,6 +34,15 @@ def options(tmp_path):
         save_interval=25,
         num_rollout=300,
         lr=1e-6,
+        kl_coef=0.0,
+        entropy_coef=0.0,
+        eps_clip=0.2,
+        eps_clip_high=0.2,
+        grpo_std_normalization=False,
+        use_tis=False,
+        tis_clip=2.0,
+        tis_clip_low=0.0,
+        dynamic_sampling_filter_path=None,
         max_tokens_per_gpu=9216,
         debug_rollout_only=False,
         eval_interval=25,
@@ -163,6 +172,48 @@ def test_sglang_memory_fraction_is_forwarded(tmp_path, monkeypatch):
     command = build_command(args, ExperimentConfig())
 
     assert command[command.index("--sglang-mem-fraction-static") + 1] == "0.65"
+
+
+def test_rl_stability_options_are_forwarded(tmp_path, monkeypatch):
+    args = options(tmp_path)
+    args.kl_coef = 0.005
+    args.entropy_coef = 0.001
+    args.eps_clip = 0.1
+    args.eps_clip_high = 0.12
+    args.grpo_std_normalization = True
+    args.use_tis = True
+    args.tis_clip = 1.5
+    args.tis_clip_low = 0.5
+    args.dynamic_sampling_filter_path = (
+        "slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std_with_fallback"
+    )
+    monkeypatch.setattr(launch, "model_arguments", lambda _slime: [])
+
+    command = build_command(args, ExperimentConfig())
+
+    def value(key):
+        return command[command.index(key) + 1]
+
+    assert value("--kl-coef") == "0.005"
+    assert value("--entropy-coef") == "0.001"
+    assert value("--eps-clip") == "0.1"
+    assert value("--eps-clip-high") == "0.12"
+    assert "--disable-grpo-std-normalization" not in command
+    assert "--use-tis" in command
+    assert value("--tis-clip") == "1.5"
+    assert value("--tis-clip-low") == "0.5"
+    assert value("--dynamic-sampling-filter-path").endswith("check_reward_nonzero_std_with_fallback")
+
+
+def test_default_rl_stability_options_preserve_previous_recipe(tmp_path, monkeypatch):
+    args = options(tmp_path)
+    monkeypatch.setattr(launch, "model_arguments", lambda _slime: [])
+
+    command = build_command(args, ExperimentConfig())
+
+    assert "--disable-grpo-std-normalization" in command
+    assert "--use-tis" not in command
+    assert "--dynamic-sampling-filter-path" not in command
 
 
 def test_invalid_parallelism_rejected_before_launch(tmp_path):

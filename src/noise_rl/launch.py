@@ -179,15 +179,14 @@ def build_command(args, config, fully_async=False):
         str(config.seed),
         "--advantage-estimator",
         "grpo",
-        "--disable-grpo-std-normalization",
         "--kl-coef",
-        "0",
+        str(getattr(args, "kl_coef", 0.0)),
         "--entropy-coef",
-        "0",
+        str(getattr(args, "entropy_coef", 0.0)),
         "--eps-clip",
-        "0.2",
+        str(getattr(args, "eps_clip", 0.2)),
         "--eps-clip-high",
-        "0.2",
+        str(getattr(args, "eps_clip_high", 0.2)),
         "--optimizer",
         "adam",
         "--lr",
@@ -236,6 +235,19 @@ def build_command(args, config, fully_async=False):
         "--attention-backend",
         "flash",
     ]
+    if not getattr(args, "grpo_std_normalization", False):
+        command.append("--disable-grpo-std-normalization")
+    if getattr(args, "use_tis", False):
+        command += [
+            "--use-tis",
+            "--tis-clip",
+            str(getattr(args, "tis_clip", 2.0)),
+            "--tis-clip-low",
+            str(getattr(args, "tis_clip_low", 0.0)),
+        ]
+    dynamic_filter = getattr(args, "dynamic_sampling_filter_path", None)
+    if dynamic_filter:
+        command += ["--dynamic-sampling-filter-path", dynamic_filter]
     if config.history_window:
         command += [
             "--custom-convert-samples-to-train-data-path",
@@ -332,6 +344,22 @@ def main(argv=None, fully_async=False):
     parser.add_argument("--eval-interval", type=int, default=25)
     parser.add_argument("--eval-repeats", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-6)
+    parser.add_argument("--kl-coef", type=float, default=0.0)
+    parser.add_argument("--entropy-coef", type=float, default=0.0)
+    parser.add_argument("--eps-clip", type=float, default=0.2)
+    parser.add_argument("--eps-clip-high", type=float, default=0.2)
+    parser.add_argument(
+        "--grpo-std-normalization",
+        action="store_true",
+        help="Keep Slime's GRPO within-group standard-deviation normalization enabled",
+    )
+    parser.add_argument("--use-tis", action="store_true", help="Enable Slime truncated importance sampling")
+    parser.add_argument("--tis-clip", type=float, default=2.0)
+    parser.add_argument("--tis-clip-low", type=float, default=0.0)
+    parser.add_argument(
+        "--dynamic-sampling-filter-path",
+        help="Optional Slime dynamic group filter import path (for example a non-zero reward-std filter)",
+    )
     parser.add_argument("--max-tokens-per-gpu", type=int, default=9216)
     parser.add_argument(
         "--max-context-tokens",
@@ -408,6 +436,12 @@ def main(argv=None, fully_async=False):
             parser.error(f"{key} must be positive")
     if args.lr <= 0:
         parser.error("lr must be positive")
+    if args.kl_coef < 0 or args.entropy_coef < 0:
+        parser.error("kl-coef and entropy-coef must be nonnegative")
+    if args.eps_clip <= 0 or args.eps_clip_high <= 0:
+        parser.error("eps-clip and eps-clip-high must be positive")
+    if args.tis_clip <= 0 or args.tis_clip_low < 0 or args.tis_clip_low > args.tis_clip:
+        parser.error("TIS bounds must satisfy 0 <= tis-clip-low <= tis-clip")
     if not 0 < args.sglang_mem_fraction_static < 1:
         parser.error("sglang-mem-fraction-static must be between 0 and 1")
     overrides = {

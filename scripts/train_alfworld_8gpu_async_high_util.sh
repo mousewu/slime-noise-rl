@@ -20,7 +20,12 @@ TASK_PYTHON_BIN="${PYTHON_BIN:-python}"
 
 TASK_CONFIG="${CONFIG:-${TASK_PROJECT_DIR}/configs/matched_loo_fully_async.yaml}"
 TASK_SEED="${SEED:-42}"
+TASK_ACTOR_GPUS="${ACTOR_GPUS:-2}"
+TASK_ROLLOUT_GPUS="${ROLLOUT_GPUS:-6}"
+TASK_TENSOR_PARALLEL="${TENSOR_PARALLEL:-2}"
+TASK_ENGINE_GPUS="${ENGINE_GPUS:-1}"
 TASK_BATCH_SIZE="${BATCH_SIZE:-64}"
+TASK_NUM_STEPS_PER_ROLLOUT="${NUM_STEPS_PER_ROLLOUT:-1}"
 TASK_CONCURRENCY="${CONCURRENCY:-192}"
 TASK_ENV_PROCESSES="${ENVIRONMENT_PROCESSES:-64}"
 TASK_ENV_RECYCLE="${ENVIRONMENT_RECYCLE_EPISODES:-32}"
@@ -30,6 +35,15 @@ TASK_MAX_CONTEXT="${MAX_CONTEXT_TOKENS:-8192}"
 TASK_MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-16384}"
 TASK_SGLANG_MEM_FRACTION="${SGLANG_MEM_FRACTION_STATIC:-0.55}"
 TASK_LR="${LR:-1e-6}"
+TASK_KL_COEF="${KL_COEF:-0}"
+TASK_ENTROPY_COEF="${ENTROPY_COEF:-0}"
+TASK_EPS_CLIP="${EPS_CLIP:-0.2}"
+TASK_EPS_CLIP_HIGH="${EPS_CLIP_HIGH:-${TASK_EPS_CLIP}}"
+TASK_USE_TIS="${USE_TIS:-0}"
+TASK_TIS_CLIP="${TIS_CLIP:-2.0}"
+TASK_TIS_CLIP_LOW="${TIS_CLIP_LOW:-0.0}"
+TASK_GRPO_STD_NORMALIZATION="${GRPO_STD_NORMALIZATION:-0}"
+TASK_DYNAMIC_FILTER="${DYNAMIC_SAMPLING_FILTER_PATH:-}"
 TASK_RUN_NAME="${RUN_NAME:-alfworld-matched-loo-async8-tp1-c${TASK_CONCURRENCY}-s${TASK_SEED}}"
 TASK_OUTPUT="${OUTPUT_DIR:-${TASK_PROJECT_DIR}/runs/${TASK_RUN_NAME}}"
 TASK_GPU_LOG="${GPU_UTILIZATION_LOG:-${TASK_OUTPUT}.gpu-utilization.csv}"
@@ -37,15 +51,35 @@ TASK_GPU_LOG="${GPU_UTILIZATION_LOG:-${TASK_OUTPUT}.gpu-utilization.csv}"
 for TASK_PATH in "${TASK_CONFIG}" "${ALFWORLD_MANIFEST}" "${HF_CHECKPOINT}" "${MEGATRON_CHECKPOINT}"; do
   [[ -e "${TASK_PATH}" ]] || { echo "Required local path does not exist: ${TASK_PATH}" >&2; exit 2; }
 done
-for TASK_NUMBER in "${TASK_BATCH_SIZE}" "${TASK_CONCURRENCY}" "${TASK_ENV_PROCESSES}" \
+for TASK_NUMBER in "${TASK_ACTOR_GPUS}" "${TASK_ROLLOUT_GPUS}" "${TASK_TENSOR_PARALLEL}" \
+  "${TASK_ENGINE_GPUS}" "${TASK_BATCH_SIZE}" "${TASK_NUM_STEPS_PER_ROLLOUT}" \
+  "${TASK_CONCURRENCY}" "${TASK_ENV_PROCESSES}" \
   "${TASK_NUM_ROLLOUT}" "${TASK_SAVE_INTERVAL}" "${TASK_MAX_CONTEXT}" "${TASK_MAX_TOKENS_PER_GPU}"; do
   case "${TASK_NUMBER}" in
     ''|*[!0-9]*|0) echo "Batch, concurrency, process, rollout, save, and token settings must be positive integers" >&2; exit 2 ;;
   esac
 done
+if (( TASK_ACTOR_GPUS + TASK_ROLLOUT_GPUS != 8 )); then
+  echo "ACTOR_GPUS + ROLLOUT_GPUS must equal 8" >&2
+  exit 2
+fi
+if (( TASK_ACTOR_GPUS % TASK_TENSOR_PARALLEL != 0 )); then
+  echo "ACTOR_GPUS must be divisible by TENSOR_PARALLEL" >&2
+  exit 2
+fi
+if (( TASK_ROLLOUT_GPUS % TASK_ENGINE_GPUS != 0 )); then
+  echo "ROLLOUT_GPUS must be divisible by ENGINE_GPUS" >&2
+  exit 2
+fi
 case "${TASK_ENV_RECYCLE}" in
   ''|*[!0-9]*) echo "ENVIRONMENT_RECYCLE_EPISODES must be a nonnegative integer" >&2; exit 2 ;;
 esac
+for TASK_BOOLEAN in "${TASK_USE_TIS}" "${TASK_GRPO_STD_NORMALIZATION}"; do
+  case "${TASK_BOOLEAN}" in
+    0|1) ;;
+    *) echo "USE_TIS and GRPO_STD_NORMALIZATION must be 0 or 1" >&2; exit 2 ;;
+  esac
+done
 if (( TASK_BATCH_SIZE * 8 < TASK_CONCURRENCY )); then
   echo "BATCH_SIZE * group_size must cover CONCURRENCY; got $((TASK_BATCH_SIZE * 8)) < ${TASK_CONCURRENCY}" >&2
   exit 2
@@ -120,12 +154,12 @@ TASK_ARGS=(
   --output "${TASK_OUTPUT}"
   --seed "${TASK_SEED}"
   --gpus 8
-  --actor-gpus 2
-  --rollout-gpus 6
-  --tensor-parallel 2
-  --engine-gpus 1
+  --actor-gpus "${TASK_ACTOR_GPUS}"
+  --rollout-gpus "${TASK_ROLLOUT_GPUS}"
+  --tensor-parallel "${TASK_TENSOR_PARALLEL}"
+  --engine-gpus "${TASK_ENGINE_GPUS}"
   --batch-size "${TASK_BATCH_SIZE}"
-  --num-steps-per-rollout 1
+  --num-steps-per-rollout "${TASK_NUM_STEPS_PER_ROLLOUT}"
   --num-rollout "${TASK_NUM_ROLLOUT}"
   --save-interval "${TASK_SAVE_INTERVAL}"
   --max-context-tokens "${TASK_MAX_CONTEXT}"
@@ -135,7 +169,22 @@ TASK_ARGS=(
   --environment-processes "${TASK_ENV_PROCESSES}"
   --environment-recycle-episodes "${TASK_ENV_RECYCLE}"
   --lr "${TASK_LR}"
+  --kl-coef "${TASK_KL_COEF}"
+  --entropy-coef "${TASK_ENTROPY_COEF}"
+  --eps-clip "${TASK_EPS_CLIP}"
+  --eps-clip-high "${TASK_EPS_CLIP_HIGH}"
+  --tis-clip "${TASK_TIS_CLIP}"
+  --tis-clip-low "${TASK_TIS_CLIP_LOW}"
 )
+if [[ "${TASK_USE_TIS}" == "1" ]]; then
+  TASK_ARGS+=(--use-tis)
+fi
+if [[ "${TASK_GRPO_STD_NORMALIZATION}" == "1" ]]; then
+  TASK_ARGS+=(--grpo-std-normalization)
+fi
+if [[ -n "${TASK_DYNAMIC_FILTER}" ]]; then
+  TASK_ARGS+=(--dynamic-sampling-filter-path "${TASK_DYNAMIC_FILTER}")
+fi
 if [[ "${USE_SWANLAB:-1}" == "1" ]]; then
   TASK_ARGS+=(
     --use-swanlab
@@ -151,5 +200,6 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
 fi
 
 echo "Starting ALFWorld fully-async training: batch=${TASK_BATCH_SIZE}, trajectories=$((TASK_BATCH_SIZE * 8)), concurrency=${TASK_CONCURRENCY}"
-echo "Topology: actor=2 GPUs (TP=2); rollout=6 independent TP=1 engines; environment_processes=${TASK_ENV_PROCESSES}; sglang_mem_fraction_static=${TASK_SGLANG_MEM_FRACTION}"
+echo "Topology: actor=${TASK_ACTOR_GPUS} GPUs (TP=${TASK_TENSOR_PARALLEL}); rollout=${TASK_ROLLOUT_GPUS} GPUs (${TASK_ENGINE_GPUS} GPU/engine); environment_processes=${TASK_ENV_PROCESSES}; sglang_mem_fraction_static=${TASK_SGLANG_MEM_FRACTION}"
+echo "Stability: lr=${TASK_LR}; kl=${TASK_KL_COEF}; entropy=${TASK_ENTROPY_COEF}; clip=${TASK_EPS_CLIP}/${TASK_EPS_CLIP_HIGH}; tis=${TASK_USE_TIS} [${TASK_TIS_CLIP_LOW}, ${TASK_TIS_CLIP}]; grpo_std_normalization=${TASK_GRPO_STD_NORMALIZATION}; dynamic_filter=${TASK_DYNAMIC_FILTER:-off}"
 bash "${TASK_PROJECT_DIR}/scripts/train_fully_async.sh" "${TASK_ARGS[@]}"

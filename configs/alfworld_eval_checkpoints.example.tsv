@@ -1,0 +1,4 @@
+clean	42	/absolute/path/to/clean-seed42-hf
+matched	42	/absolute/path/to/matched-seed42-hf
+independent	42	/absolute/path/to/independent-seed42-hf
+coupled_prompt	42	/absolute/path/to/coupled-prompt-seed42-hf

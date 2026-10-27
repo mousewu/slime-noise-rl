@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -85,6 +86,28 @@ def test_standalone_evaluation_workflow(tmp_path, fixture_server):
     assert kwargs["trust_remote_code"] is False
     with pytest.raises(FileExistsError):
         asyncio.run(cli.run_evaluation(args))
+
+
+def test_evaluation_noise_override_and_stable_shard(tmp_path, fixture_server):
+    args = inputs(tmp_path)
+    Path(args.data).unlink()
+    write_records(args.data, mini_records(4, "valid_unseen"))
+    args.shard_count = 2
+    args.shard_index = 1
+    args.action_drop = 0.25
+    args.observation_loss = 0.0
+    args.burst_probability = 0.1
+    args.burst_length = 2
+    args.concurrency = 3
+    args.environment_processes = 0
+    args.limit = None
+    report = asyncio.run(cli.run_evaluation(args))
+    rows = cli.load_episode_records(args.output)
+    assert report["tasks"] == 2
+    assert {row["plan"]["group_id"] for row in rows} == {1, 3}
+    assert all(row["config"]["noise"]["action_drop"] == 0.25 for row in rows)
+    assert all(row["config"]["noise"]["burst_length"] == 2 for row in rows)
+    assert all(row["config"]["concurrency"] == 3 for row in rows)
 
 
 def test_frozen_policy_probe_workflow(tmp_path, fixture_server):

@@ -48,12 +48,57 @@ async def run_evaluation(args):
         raise FileExistsError("Evaluation output exists; choose a new file before starting inference")
     config = load_config(args.config)
     config = replace(config, eval_seed=args.seed)
+    explicit_noise = any(
+        getattr(args, name, None) is not None
+        for name in ("action_drop", "observation_loss", "burst_probability", "burst_length")
+    )
+    if args.clean and explicit_noise:
+        raise ValueError("--clean cannot be combined with explicit noise overrides")
     if args.clean:
         config = replace(config, noise=NoiseConfig(action_drop=0, observation_loss=0))
+    elif explicit_noise:
+        current = config.noise
+        config = replace(
+            config,
+            noise=NoiseConfig(
+                action_drop=(
+                    current.action_drop if args.action_drop is None else args.action_drop
+                ),
+                observation_loss=(
+                    current.observation_loss
+                    if args.observation_loss is None
+                    else args.observation_loss
+                ),
+                burst_probability=(
+                    current.burst_probability
+                    if args.burst_probability is None
+                    else args.burst_probability
+                ),
+                burst_length=(
+                    current.burst_length if args.burst_length is None else args.burst_length
+                ),
+            ),
+        )
+    if getattr(args, "concurrency", None) is not None:
+        config = replace(config, concurrency=args.concurrency)
+    if getattr(args, "environment_processes", None) is not None:
+        config = replace(config, environment_processes=args.environment_processes)
     records = read_records(args.data)
     if any(r["metadata"]["task"].get("split") == "train" for r in records):
         raise ValueError("Use a held-out manifest for evaluation")
     validate_local_records(records)
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        records = records[:limit]
+    shard_count = getattr(args, "shard_count", 1)
+    shard_index = getattr(args, "shard_index", 0)
+    indexed_records = [
+        (group_id, record)
+        for group_id, record in enumerate(records)
+        if group_id % shard_count == shard_index
+    ]
+    if not indexed_records:
+        raise ValueError(f"Evaluation shard {shard_index}/{shard_count} contains no tasks")
     tokenizer = load_local_tokenizer(args.model)
     client = SGLangClient(args.url, config.request_timeout)
     semaphore = asyncio.Semaphore(config.concurrency)
@@ -74,7 +119,7 @@ async def run_evaluation(args):
 
     try:
         output = await asyncio.gather(
-            *(one(i, r, rank) for i, r in enumerate(records) for rank in range(args.repeats))
+            *(one(i, r, rank) for i, r in indexed_records for rank in range(args.repeats))
         )
     finally:
         await client.close()
@@ -184,6 +229,15 @@ def main(argv=None):
     evaluate.add_argument("--seed", type=int, default=20260904)
     evaluate.add_argument("--temperature", type=float, default=0.8)
     evaluate.add_argument("--clean", action="store_true")
+    evaluate.add_argument("--action-drop", type=float)
+    evaluate.add_argument("--observation-loss", type=float)
+    evaluate.add_argument("--burst-probability", type=float)
+    evaluate.add_argument("--burst-length", type=int)
+    evaluate.add_argument("--concurrency", type=int)
+    evaluate.add_argument("--environment-processes", type=int)
+    evaluate.add_argument("--limit", type=int)
+    evaluate.add_argument("--shard-count", type=int, default=1)
+    evaluate.add_argument("--shard-index", type=int, default=0)
     evaluate.add_argument("--output", required=True)
     probe = commands.add_parser("probe", help="Frozen-model environment x policy nested-sampling pilot")
     probe.add_argument("--config", required=True)
@@ -220,6 +274,14 @@ def main(argv=None):
     elif args.command == "evaluate":
         if args.repeats < 1 or args.temperature < 0:
             parser.error("repeats must be positive and temperature nonnegative")
+        if args.limit is not None and args.limit < 1:
+            parser.error("limit must be positive")
+        if args.shard_count < 1 or not 0 <= args.shard_index < args.shard_count:
+            parser.error("require shard-count>=1 and 0<=shard-index<shard-count")
+        if args.concurrency is not None and args.concurrency < 1:
+            parser.error("concurrency must be positive")
+        if args.environment_processes is not None and args.environment_processes < 0:
+            parser.error("environment-processes must be nonnegative")
         result = asyncio.run(run_evaluation(args))
     elif args.command == "probe":
         if args.tasks < 1 or args.scenarios < 2 or args.policy_samples < 2:

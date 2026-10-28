@@ -25,6 +25,10 @@ TASK_MEM_FRACTION="${SGLANG_MEM_FRACTION_STATIC:-0.80}"
 TASK_HOST="${SGLANG_HOST:-127.0.0.1}"
 TASK_PORT_BASE="${SGLANG_PORT_BASE:-31000}"
 TASK_STARTUP_TIMEOUT="${SGLANG_STARTUP_TIMEOUT:-600}"
+TASK_CLEANUP_TIMEOUT="${SGLANG_CLEANUP_TIMEOUT:-30}"
+TASK_CLEANUP_PAUSE="${CHECKPOINT_CLEANUP_SECONDS:-5}"
+TASK_STARTUP_STAGGER="${SGLANG_STARTUP_STAGGER_SECONDS:-20}"
+TASK_DROP_CACHE="${SGLANG_DROP_CACHE_AFTER_LOAD:-1}"
 TASK_UTIL_MIN="${GPU_UTILIZATION_MIN:-70}"
 TASK_UTIL_INTERVAL="${GPU_UTILIZATION_INTERVAL_SECONDS:-2}"
 TASK_ALLOW_LOW_UTIL="${ALLOW_LOW_GPU_UTILIZATION:-0}"
@@ -36,10 +40,15 @@ for TASK_PATH in "${ALFWORLD_EVAL_DATA}" "${ALFWORLD_EVAL_CHECKPOINTS_TSV}" "${T
 done
 [[ ! -e "${TASK_OUTPUT}" ]] || { echo "Refusing to reuse output directory: ${TASK_OUTPUT}" >&2; exit 2; }
 for TASK_VALUE in "${TASK_GPU_COUNT}" "${TASK_REPEATS}" "${TASK_CONCURRENCY}" \
-  "${TASK_ENV_PROCESSES}" "${TASK_CONTEXT}" "${TASK_PORT_BASE}" "${TASK_STARTUP_TIMEOUT}"; do
+  "${TASK_ENV_PROCESSES}" "${TASK_CONTEXT}" "${TASK_PORT_BASE}" "${TASK_STARTUP_TIMEOUT}" \
+  "${TASK_CLEANUP_TIMEOUT}"; do
   case "${TASK_VALUE}" in ''|*[!0-9]*|0) echo "GPU count, repeats, concurrency, process count, context and ports must be positive integers" >&2; exit 2;; esac
 done
 case "${TASK_LIMIT}" in ''|*[!0-9]*) echo "EVAL_TASK_LIMIT must be a nonnegative integer" >&2; exit 2;; esac
+case "${TASK_CLEANUP_PAUSE}" in ''|*[!0-9]*) echo "CHECKPOINT_CLEANUP_SECONDS must be a nonnegative integer" >&2; exit 2;; esac
+case "${TASK_STARTUP_STAGGER}" in ''|*[!0-9]*) echo "SGLANG_STARTUP_STAGGER_SECONDS must be a nonnegative integer" >&2; exit 2;; esac
+case "${TASK_DROP_CACHE}" in 0|1) ;; *) echo "SGLANG_DROP_CACHE_AFTER_LOAD must be 0 or 1" >&2; exit 2;; esac
+command -v setsid >/dev/null 2>&1 || { echo "setsid is required for reliable SGLang process-group cleanup" >&2; exit 2; }
 
 IFS=',' read -r -a TASK_GPU_IDS <<<"${CUDA_VISIBLE_DEVICES:-}"
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -77,14 +86,45 @@ print(f"Validated {len(rows)} local HF checkpoints")
 PY
 
 TASK_CHILD_PIDS=()
+TASK_SERVER_PIDS=()
 cleanup_children() {
+  # Evaluators explicitly reap their ALFWorld children.  These signals are a
+  # final safety net for a failed evaluator or utilization monitor.
   for TASK_PID in "${TASK_CHILD_PIDS[@]:-}"; do
     [[ -n "${TASK_PID}" ]] && kill "${TASK_PID}" 2>/dev/null || true
   done
   for TASK_PID in "${TASK_CHILD_PIDS[@]:-}"; do
     [[ -n "${TASK_PID}" ]] && wait "${TASK_PID}" 2>/dev/null || true
   done
+  # SGLang launches scheduler/tokenizer worker children.  Killing only the
+  # launch_server PID can leave those workers and their host/GPU allocations
+  # alive while the next checkpoint starts.  Every server is therefore its
+  # own session/process group and is terminated as a unit.
+  for TASK_PID in "${TASK_SERVER_PIDS[@]:-}"; do
+    [[ -n "${TASK_PID}" ]] && kill -TERM -- "-${TASK_PID}" 2>/dev/null || true
+  done
+  TASK_DEADLINE=$((SECONDS + TASK_CLEANUP_TIMEOUT))
+  while (( SECONDS < TASK_DEADLINE )); do
+    TASK_ALIVE=0
+    for TASK_PID in "${TASK_SERVER_PIDS[@]:-}"; do
+      if [[ -n "${TASK_PID}" ]] && kill -0 -- "-${TASK_PID}" 2>/dev/null; then
+        TASK_ALIVE=1
+      fi
+    done
+    (( TASK_ALIVE == 0 )) && break
+    sleep 1
+  done
+  for TASK_PID in "${TASK_SERVER_PIDS[@]:-}"; do
+    if [[ -n "${TASK_PID}" ]] && kill -0 -- "-${TASK_PID}" 2>/dev/null; then
+      echo "SGLang process group ${TASK_PID} did not exit after ${TASK_CLEANUP_TIMEOUT}s; sending SIGKILL" >&2
+      kill -KILL -- "-${TASK_PID}" 2>/dev/null || true
+    fi
+  done
+  for TASK_PID in "${TASK_SERVER_PIDS[@]:-}"; do
+    [[ -n "${TASK_PID}" ]] && wait "${TASK_PID}" 2>/dev/null || true
+  done
   TASK_CHILD_PIDS=()
+  TASK_SERVER_PIDS=()
 }
 trap 'TASK_STATUS=$?; cleanup_children; exit ${TASK_STATUS}' EXIT
 trap 'exit 130' INT TERM
@@ -104,6 +144,21 @@ while time.monotonic() < deadline:
     time.sleep(2)
 raise SystemExit(f"Timed out waiting for {url}")
 PY
+}
+
+print_memory_diagnostics() {
+  echo "Host memory:"
+  free -h 2>/dev/null || true
+  for TASK_MEMORY_FILE in \
+    /sys/fs/cgroup/memory.current \
+    /sys/fs/cgroup/memory.peak \
+    /sys/fs/cgroup/memory.max \
+    /sys/fs/cgroup/memory.events; do
+    if [[ -r "${TASK_MEMORY_FILE}" ]]; then
+      echo "===== ${TASK_MEMORY_FILE} ====="
+      cat "${TASK_MEMORY_FILE}" || true
+    fi
+  done
 }
 
 condition_args() {
@@ -146,19 +201,30 @@ while IFS=$'\t' read -r TASK_METHOD TASK_SEED_ID TASK_CHECKPOINT; do
   TASK_CHECKPOINT_DIR="${TASK_OUTPUT}/${TASK_LABEL}"
   mkdir -p -- "${TASK_CHECKPOINT_DIR}/logs"
   echo "Evaluating ${TASK_LABEL}: ${TASK_CHECKPOINT}"
+  print_memory_diagnostics
 
-  TASK_SERVER_PIDS=()
+  TASK_LOADER_ARGS=()
+  [[ "${TASK_DROP_CACHE}" == 1 ]] && TASK_LOADER_ARGS+=(--weight-loader-drop-cache-after-load)
   for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do
     TASK_PORT=$((TASK_PORT_BASE + TASK_I))
-    CUDA_VISIBLE_DEVICES="${TASK_GPU_IDS[TASK_I]}" "${TASK_SGLANG_PYTHON}" -m sglang.launch_server \
+    setsid env CUDA_VISIBLE_DEVICES="${TASK_GPU_IDS[TASK_I]}" \
+      "${TASK_SGLANG_PYTHON}" -m sglang.launch_server \
       --model-path "${TASK_CHECKPOINT}" --host "${TASK_HOST}" --port "${TASK_PORT}" \
       --tp-size 1 --dtype bfloat16 --context-length "${TASK_CONTEXT}" \
-      --mem-fraction-static "${TASK_MEM_FRACTION}" \
+      --mem-fraction-static "${TASK_MEM_FRACTION}" "${TASK_LOADER_ARGS[@]}" \
       >"${TASK_CHECKPOINT_DIR}/logs/sglang-gpu${TASK_I}.log" 2>&1 &
-    TASK_SERVER_PIDS+=("$!"); TASK_CHILD_PIDS+=("$!")
+    TASK_SERVER_PIDS+=("$!")
+    if (( TASK_I + 1 < TASK_GPU_COUNT && TASK_STARTUP_STAGGER > 0 )); then
+      sleep "${TASK_STARTUP_STAGGER}"
+    fi
   done
   for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do
-    wait_for_server "http://${TASK_HOST}:$((TASK_PORT_BASE + TASK_I))" "${TASK_SERVER_PIDS[TASK_I]}"
+    if ! wait_for_server "http://${TASK_HOST}:$((TASK_PORT_BASE + TASK_I))" "${TASK_SERVER_PIDS[TASK_I]}"; then
+      echo "SGLang GPU ${TASK_I} failed during startup; memory diagnostics follow" >&2
+      print_memory_diagnostics >&2
+      tail -n 120 "${TASK_CHECKPOINT_DIR}/logs/sglang-gpu${TASK_I}.log" >&2 || true
+      exit 1
+    fi
   done
 
   for TASK_CONDITION in "${TASK_CONDITION_LIST[@]}"; do
@@ -194,6 +260,7 @@ while IFS=$'\t' read -r TASK_METHOD TASK_SEED_ID TASK_CHECKPOINT; do
     done
     set -e
     kill "${TASK_MONITOR_PID}" 2>/dev/null || true; wait "${TASK_MONITOR_PID}" 2>/dev/null || true
+    TASK_CHILD_PIDS=()
     (( TASK_FAILED == 0 )) || { echo "Evaluation failed; inspect ${TASK_CONDITION_DIR}/shard*.log" >&2; exit 1; }
     "${TASK_PYTHON}" -m noise_rl.eval_matrix merge --output "${TASK_CONDITION_DIR}/episodes.jsonl" "${TASK_SHARDS[@]}"
     set +e
@@ -206,6 +273,10 @@ while IFS=$'\t' read -r TASK_METHOD TASK_SEED_ID TASK_CHECKPOINT; do
     fi
   done
   cleanup_children
+  if (( TASK_CLEANUP_PAUSE > 0 )); then
+    echo "Waiting ${TASK_CLEANUP_PAUSE}s for checkpoint resources to settle"
+    sleep "${TASK_CLEANUP_PAUSE}"
+  fi
 done <"${ALFWORLD_EVAL_CHECKPOINTS_TSV}"
 
 "${TASK_PYTHON}" -m noise_rl.eval_matrix table --root "${TASK_OUTPUT}" \

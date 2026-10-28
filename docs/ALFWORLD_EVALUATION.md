@@ -48,6 +48,13 @@ bash scripts/evaluate_alfworld_noise_matrix.sh
 `environment_queue_seconds` 已很低时，它只会增加 CPU 与内存压力。只有明确接受低利用率
 继续完成矩阵时，才设置 `ALLOW_LOW_GPU_UTILIZATION=1`。
 
+checkpoint 切换时，脚本会同步回收 ALFWorld 子进程，并以独立进程组关闭 SGLang 的
+launcher、scheduler 和 tokenizer workers。默认将四个 SGLang 实例的启动错开 20 秒，并在
+加载权重后释放文件页缓存，避免同时加载多份模型产生主机内存峰值。可用
+`SGLANG_STARTUP_STAGGER_SECONDS`、`SGLANG_CLEANUP_TIMEOUT` 和
+`CHECKPOINT_CLEANUP_SECONDS` 调整。若服务仍被 `SIGKILL`，主日志会同时打印 cgroup 的
+`memory.events`；其中 `oom_kill` 增长即可确认是容器内存上限触发，而不是评测代码主动退出。
+
 最终结果位于：
 
 - `summary.tsv`：模型 × 噪声条件主表；

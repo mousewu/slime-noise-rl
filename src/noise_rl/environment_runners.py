@@ -277,9 +277,13 @@ class ProcessEnvironmentPool:
         if self._closed:
             return
         self._closed = True
-        self._wait_executor.shutdown(wait=False, cancel_futures=True)
+        # All trajectory leases have returned before evaluation invokes this
+        # method.  Waiting here is intentional: wait=False lets spawn children
+        # outlive a short evaluator process and repeated matrix conditions can
+        # then exhaust host memory.
+        self._wait_executor.shutdown(wait=True, cancel_futures=True)
         for slot in self._slots:
-            slot.executor.shutdown(wait=False, cancel_futures=True)
+            slot.executor.shutdown(wait=True, cancel_futures=True)
 
 
 _POOLS: dict[tuple[int, int], ProcessEnvironmentPool] = {}

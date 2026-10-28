@@ -16,6 +16,7 @@ from .data import (
     validate_local_records,
     write_records,
 )
+from .environment_runners import shutdown_process_environment_pools
 from .fixtures import ByteTokenizer, ScriptedClient
 from .metrics import balanced_variance_components, episode_record, paired_comparison, summarize
 from .sampling import plan_sample
@@ -123,6 +124,10 @@ async def run_evaluation(args):
         )
     finally:
         await client.close()
+        # Evaluation runs are short-lived subprocesses.  Reap every TextWorld
+        # child before the parent exits so a checkpoint matrix cannot
+        # accumulate ALFWorld runners across conditions.
+        await asyncio.to_thread(shutdown_process_environment_pools)
     write_records(args.output, output)
     report = summarize(output)
     atomic_json(str(args.output) + ".summary.json", report)

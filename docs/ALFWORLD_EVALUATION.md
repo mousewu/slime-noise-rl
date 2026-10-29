@@ -32,19 +32,21 @@ ALFWORLD_EVAL_CHECKPOINTS_TSV=configs/alfworld_eval_checkpoints.tsv \
 ALFWORLD_EVAL_OUTPUT=runs/alfworld-noise-eval-main \
 EVAL_GPUS=4 \
 EVAL_REPEATS=4 \
-EVAL_CONCURRENCY_PER_GPU=48 \
-EVAL_ENVIRONMENT_PROCESSES_PER_GPU=24 \
+EVAL_CONCURRENCY_PER_GPU=96 \
+EVAL_ENVIRONMENT_PROCESSES_PER_GPU=32 \
 SGLANG_MEM_FRACTION_STATIC=0.80 \
 GPU_UTILIZATION_MIN=70 \
 bash scripts/evaluate_alfworld_noise_matrix.sh
 ```
 
-每张 GPU 启动一个 TP=1 SGLang 实例；134 个任务稳定分成 4 个互斥分片。模型加载阶段
-不计入利用率。每个 checkpoint/噪声条件都有独立的 `gpu-utilization.json`；平均值低于
-70% 时脚本保留已完成结果并停止后续测评。这是运行时门槛，而不是仅凭参数预测利用率。
+每张 GPU 启动一个 TP=1 SGLang 实例，并加载一个不同 checkpoint；同一 wave 中四张卡分别
+评估四个模型，每个模型都运行完整的 134 个任务 × 4 repeats，不再把一个小评测集切成四份。
+12 个 checkpoint 会组成 3 个 wave。checkpoint 数必须能被 `EVAL_GPUS` 整除，以免最后一个
+wave 留下空闲 GPU。模型加载阶段不计入脚本的条件利用率。每个 checkpoint/噪声条件都有
+独立的 `gpu-utilization.json`；平均值低于门槛时脚本保留已完成结果并停止后续测评。
 
-若门槛未通过，先将 `EVAL_GPUS` 降为 2（同时只暴露两张卡），使单卡获得更多轨迹；其次
-把 `EVAL_CONCURRENCY_PER_GPU` 从 48 调到 64。不要先增加环境进程：当
+默认每卡推理并发为 96、环境进程为 32。若门槛未通过，可将
+`EVAL_CONCURRENCY_PER_GPU` 从 96 调到 128，但不要先大幅增加环境进程：当
 `environment_queue_seconds` 已很低时，它只会增加 CPU 与内存压力。只有明确接受低利用率
 继续完成矩阵时，才设置 `ALLOW_LOW_GPU_UTILIZATION=1`。
 

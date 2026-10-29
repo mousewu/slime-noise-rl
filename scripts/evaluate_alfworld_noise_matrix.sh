@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # Evaluate multiple local HF checkpoints on held-out ALFWorld under a fixed
-# noise matrix. Each GPU runs an independent TP=1 SGLang replica and receives
-# a disjoint task shard. No model or dataset is downloaded.
+# noise matrix. Each GPU runs a different checkpoint in an independent TP=1
+# SGLang replica and evaluates the complete held-out manifest. No model or
+# dataset is downloaded.
 
 TASK_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TASK_PYTHON="${PYTHON_BIN:-python}"
@@ -18,8 +19,8 @@ TASK_GPU_COUNT="${EVAL_GPUS:-4}"
 TASK_REPEATS="${EVAL_REPEATS:-4}"
 TASK_SEED="${EVAL_SEED:-20261027}"
 TASK_TEMPERATURE="${EVAL_TEMPERATURE:-0.8}"
-TASK_CONCURRENCY="${EVAL_CONCURRENCY_PER_GPU:-48}"
-TASK_ENV_PROCESSES="${EVAL_ENVIRONMENT_PROCESSES_PER_GPU:-24}"
+TASK_CONCURRENCY="${EVAL_CONCURRENCY_PER_GPU:-96}"
+TASK_ENV_PROCESSES="${EVAL_ENVIRONMENT_PROCESSES_PER_GPU:-32}"
 TASK_CONTEXT="${SGLANG_CONTEXT_LENGTH:-8192}"
 TASK_MEM_FRACTION="${SGLANG_MEM_FRACTION_STATIC:-0.80}"
 TASK_HOST="${SGLANG_HOST:-127.0.0.1}"
@@ -65,10 +66,14 @@ mkdir -p -- "${TASK_OUTPUT}"
 export PYTHONPATH="${TASK_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1
 
-"${TASK_PYTHON}" - "${ALFWORLD_EVAL_CHECKPOINTS_TSV}" <<'PY'
+"${TASK_PYTHON}" - "${ALFWORLD_EVAL_CHECKPOINTS_TSV}" "${TASK_GPU_COUNT}" <<'PY'
 import csv, pathlib, sys
 path = pathlib.Path(sys.argv[1])
-rows = list(csv.reader(path.open(encoding="utf-8"), delimiter="\t"))
+gpu_count = int(sys.argv[2])
+rows = [
+    row for row in csv.reader(path.open(encoding="utf-8"), delimiter="\t")
+    if row and any(value.strip() for value in row) and not row[0].lstrip().startswith("#")
+]
 if not rows:
     raise SystemExit("Checkpoint TSV is empty")
 seen = set()
@@ -82,7 +87,12 @@ for line, row in enumerate(rows, 1):
     checkpoint = pathlib.Path(row[2]).expanduser()
     if not checkpoint.is_dir():
         raise SystemExit(f"{path}:{line}: local HF checkpoint is not a directory: {checkpoint}")
-print(f"Validated {len(rows)} local HF checkpoints")
+if len(rows) % gpu_count:
+    raise SystemExit(
+        f"Checkpoint count {len(rows)} must be divisible by EVAL_GPUS={gpu_count}; "
+        "a partial final wave would leave allocated GPUs idle"
+    )
+print(f"Validated {len(rows)} local HF checkpoints in {len(rows) // gpu_count} wave(s)")
 PY
 
 TASK_CHILD_PIDS=()
@@ -194,18 +204,42 @@ raise SystemExit(0 if report["passed"] else 3)
 PY
 }
 
+TASK_METHODS=()
+TASK_SEEDS=()
+TASK_CHECKPOINTS=()
+while IFS=$'\t' read -r TASK_METHOD TASK_SEED_ID TASK_CHECKPOINT TASK_EXTRA; do
+  [[ -z "${TASK_METHOD// /}" ]] && continue
+  [[ "${TASK_METHOD}" == \#* ]] && continue
+  TASK_METHODS+=("${TASK_METHOD}")
+  TASK_SEEDS+=("${TASK_SEED_ID}")
+  TASK_CHECKPOINTS+=("${TASK_CHECKPOINT}")
+done <"${ALFWORLD_EVAL_CHECKPOINTS_TSV}"
+
 IFS=',' read -r -a TASK_CONDITION_LIST <<<"${TASK_CONDITIONS}"
-while IFS=$'\t' read -r TASK_METHOD TASK_SEED_ID TASK_CHECKPOINT; do
-  [[ -n "${TASK_METHOD}" ]] || continue
-  TASK_LABEL="${TASK_METHOD}-s${TASK_SEED_ID}"
-  TASK_CHECKPOINT_DIR="${TASK_OUTPUT}/${TASK_LABEL}"
-  mkdir -p -- "${TASK_CHECKPOINT_DIR}/logs"
-  echo "Evaluating ${TASK_LABEL}: ${TASK_CHECKPOINT}"
+TASK_CHECKPOINT_COUNT="${#TASK_CHECKPOINTS[@]}"
+TASK_WAVE_COUNT=$((TASK_CHECKPOINT_COUNT / TASK_GPU_COUNT))
+
+for ((TASK_WAVE=0; TASK_WAVE<TASK_WAVE_COUNT; TASK_WAVE++)); do
+  TASK_WAVE_DIR="${TASK_OUTPUT}/_waves/wave${TASK_WAVE}"
+  mkdir -p -- "${TASK_WAVE_DIR}"
+  TASK_WAVE_LABELS=()
+  TASK_WAVE_CHECKPOINTS=()
+  TASK_WAVE_DIRS=()
+  echo "Starting checkpoint wave $((TASK_WAVE + 1))/${TASK_WAVE_COUNT}; TP=1 per GPU"
   print_memory_diagnostics
 
   TASK_LOADER_ARGS=()
   [[ "${TASK_DROP_CACHE}" == 1 ]] && TASK_LOADER_ARGS+=(--weight-loader-drop-cache-after-load)
   for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do
+    TASK_INDEX=$((TASK_WAVE * TASK_GPU_COUNT + TASK_I))
+    TASK_LABEL="${TASK_METHODS[TASK_INDEX]}-s${TASK_SEEDS[TASK_INDEX]}"
+    TASK_CHECKPOINT="${TASK_CHECKPOINTS[TASK_INDEX]}"
+    TASK_CHECKPOINT_DIR="${TASK_OUTPUT}/${TASK_LABEL}"
+    TASK_WAVE_LABELS+=("${TASK_LABEL}")
+    TASK_WAVE_CHECKPOINTS+=("${TASK_CHECKPOINT}")
+    TASK_WAVE_DIRS+=("${TASK_CHECKPOINT_DIR}")
+    mkdir -p -- "${TASK_CHECKPOINT_DIR}/logs"
+    echo "GPU ${TASK_GPU_IDS[TASK_I]}: ${TASK_LABEL} -> ${TASK_CHECKPOINT}"
     TASK_PORT=$((TASK_PORT_BASE + TASK_I))
     setsid env CUDA_VISIBLE_DEVICES="${TASK_GPU_IDS[TASK_I]}" \
       "${TASK_SGLANG_PYTHON}" -m sglang.launch_server \
@@ -218,66 +252,75 @@ while IFS=$'\t' read -r TASK_METHOD TASK_SEED_ID TASK_CHECKPOINT; do
       sleep "${TASK_STARTUP_STAGGER}"
     fi
   done
+
   for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do
     if ! wait_for_server "http://${TASK_HOST}:$((TASK_PORT_BASE + TASK_I))" "${TASK_SERVER_PIDS[TASK_I]}"; then
-      echo "SGLang GPU ${TASK_I} failed during startup; memory diagnostics follow" >&2
+      echo "SGLang GPU ${TASK_I} (${TASK_WAVE_LABELS[TASK_I]}) failed during startup" >&2
       print_memory_diagnostics >&2
-      tail -n 120 "${TASK_CHECKPOINT_DIR}/logs/sglang-gpu${TASK_I}.log" >&2 || true
+      tail -n 120 "${TASK_WAVE_DIRS[TASK_I]}/logs/sglang-gpu${TASK_I}.log" >&2 || true
       exit 1
     fi
   done
 
   for TASK_CONDITION in "${TASK_CONDITION_LIST[@]}"; do
     TASK_CONDITION="${TASK_CONDITION// /}"
-    TASK_CONDITION_DIR="${TASK_CHECKPOINT_DIR}/${TASK_CONDITION}"
-    mkdir -p -- "${TASK_CONDITION_DIR}"
     read -r -a TASK_NOISE_ARGS <<<"$(condition_args "${TASK_CONDITION}")"
-    TASK_GPU_CSV="${TASK_CONDITION_DIR}/gpu-utilization.csv"
+    TASK_WAVE_CONDITION_DIR="${TASK_WAVE_DIR}/${TASK_CONDITION}"
+    mkdir -p -- "${TASK_WAVE_CONDITION_DIR}"
+    TASK_GPU_CSV="${TASK_WAVE_CONDITION_DIR}/gpu-utilization.csv"
     nvidia-smi -i "${TASK_GPU_ID_CSV}" --query-gpu=timestamp,index,utilization.gpu \
       --format=csv,noheader,nounits -l "${TASK_UTIL_INTERVAL}" >"${TASK_GPU_CSV}" 2>&1 &
     TASK_MONITOR_PID=$!; TASK_CHILD_PIDS+=("${TASK_MONITOR_PID}")
 
     TASK_EVAL_PIDS=()
-    TASK_SHARDS=()
     for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do
-      TASK_SHARD="${TASK_CONDITION_DIR}/shard${TASK_I}.jsonl"
-      TASK_SHARDS+=("${TASK_SHARD}")
+      TASK_CONDITION_DIR="${TASK_WAVE_DIRS[TASK_I]}/${TASK_CONDITION}"
+      mkdir -p -- "${TASK_CONDITION_DIR}"
       TASK_LIMIT_ARGS=(); (( TASK_LIMIT > 0 )) && TASK_LIMIT_ARGS=(--limit "${TASK_LIMIT}")
+      echo "Evaluating ${TASK_WAVE_LABELS[TASK_I]}/${TASK_CONDITION} on GPU ${TASK_GPU_IDS[TASK_I]}"
       "${TASK_PYTHON}" -m noise_rl.cli evaluate \
-        --config "${TASK_CONFIG}" --data "${ALFWORLD_EVAL_DATA}" --model "${TASK_CHECKPOINT}" \
+        --config "${TASK_CONFIG}" --data "${ALFWORLD_EVAL_DATA}" \
+        --model "${TASK_WAVE_CHECKPOINTS[TASK_I]}" \
         --url "http://${TASK_HOST}:$((TASK_PORT_BASE + TASK_I))" \
         --repeats "${TASK_REPEATS}" --seed "${TASK_SEED}" --temperature "${TASK_TEMPERATURE}" \
         --concurrency "${TASK_CONCURRENCY}" --environment-processes "${TASK_ENV_PROCESSES}" \
-        --shard-count "${TASK_GPU_COUNT}" --shard-index "${TASK_I}" \
-        "${TASK_LIMIT_ARGS[@]}" "${TASK_NOISE_ARGS[@]}" --output "${TASK_SHARD}" \
-        >"${TASK_CONDITION_DIR}/shard${TASK_I}.log" 2>&1 &
+        "${TASK_LIMIT_ARGS[@]}" "${TASK_NOISE_ARGS[@]}" \
+        --output "${TASK_CONDITION_DIR}/episodes.jsonl" \
+        >"${TASK_CONDITION_DIR}/evaluation.log" 2>&1 &
       TASK_EVAL_PIDS+=("$!"); TASK_CHILD_PIDS+=("$!")
     done
+
     TASK_FAILED=0
     set +e
     for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do
       wait "${TASK_EVAL_PIDS[TASK_I]}" || TASK_FAILED=1
     done
     set -e
-    kill "${TASK_MONITOR_PID}" 2>/dev/null || true; wait "${TASK_MONITOR_PID}" 2>/dev/null || true
+    kill "${TASK_MONITOR_PID}" 2>/dev/null || true
+    wait "${TASK_MONITOR_PID}" 2>/dev/null || true
     TASK_CHILD_PIDS=()
-    (( TASK_FAILED == 0 )) || { echo "Evaluation failed; inspect ${TASK_CONDITION_DIR}/shard*.log" >&2; exit 1; }
-    "${TASK_PYTHON}" -m noise_rl.eval_matrix merge --output "${TASK_CONDITION_DIR}/episodes.jsonl" "${TASK_SHARDS[@]}"
+    (( TASK_FAILED == 0 )) || { echo "Evaluation failed; inspect */${TASK_CONDITION}/evaluation.log" >&2; exit 1; }
+
     set +e
-    measure_utilization "${TASK_GPU_CSV}" "${TASK_CONDITION_DIR}/gpu-utilization.json"
+    measure_utilization "${TASK_GPU_CSV}" "${TASK_WAVE_CONDITION_DIR}/gpu-utilization.json"
     TASK_UTIL_STATUS=$?
     set -e
+    for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do
+      cp "${TASK_WAVE_CONDITION_DIR}/gpu-utilization.json" \
+        "${TASK_WAVE_DIRS[TASK_I]}/${TASK_CONDITION}/gpu-utilization.json"
+    done
     if (( TASK_UTIL_STATUS != 0 )) && [[ "${TASK_ALLOW_LOW_UTIL}" != 1 ]]; then
-      echo "GPU utilization gate failed for ${TASK_LABEL}/${TASK_CONDITION}; tune concurrency/GPU count before continuing" >&2
+      echo "GPU utilization gate failed for wave ${TASK_WAVE}/${TASK_CONDITION}" >&2
       exit 3
     fi
   done
+
   cleanup_children
   if (( TASK_CLEANUP_PAUSE > 0 )); then
     echo "Waiting ${TASK_CLEANUP_PAUSE}s for checkpoint resources to settle"
     sleep "${TASK_CLEANUP_PAUSE}"
   fi
-done <"${ALFWORLD_EVAL_CHECKPOINTS_TSV}"
+done
 
 "${TASK_PYTHON}" -m noise_rl.eval_matrix table --root "${TASK_OUTPUT}" \
   --output-tsv "${TASK_OUTPUT}/summary.tsv" --output-json "${TASK_OUTPUT}/summary.json"

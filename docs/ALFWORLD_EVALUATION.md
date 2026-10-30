@@ -41,6 +41,26 @@ GPU_UTILIZATION_MIN=70 \
 bash scripts/evaluate_alfworld_noise_matrix.sh
 ```
 
+## 单 checkpoint、单 GPU 测评
+
+先用一个 TP=1 SGLang 实例验证 checkpoint 和 CUDA 运行时，可执行：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 \
+HF_CHECKPOINT=/absolute/path/to/local-hf-checkpoint \
+ALFWORLD_EVAL_DATA=data/alfworld/valid_unseen.jsonl \
+ALFWORLD_EVAL_OUTPUT=runs/alfworld-single-checkpoint-eval \
+EVAL_METHOD=matched \
+EVAL_TRAIN_SEED=42 \
+EVAL_CONDITIONS=matched,clean,action-only,observation-only,strong \
+bash scripts/evaluate_alfworld_single_checkpoint.sh
+```
+
+也可用 `EVAL_GPU_ID=3` 选择物理 GPU。该脚本不会安装或下载任何依赖、模型和数据，默认
+`concurrency=64`、`environment_processes=16`，并复用矩阵脚本的心跳、SGLang stall 检测、
+环境 RPC 超时和 GPU 利用率统计。单卡诊断默认不因利用率低于 70% 而中止；仍会写出
+`gpu-utilization.json`。如需只验证一个条件，可设置 `EVAL_CONDITIONS=matched`。
+
 每张 GPU 启动一个 TP=1 SGLang 实例，并加载一个不同 checkpoint；同一 wave 中四张卡分别
 评估四个模型，每个模型都运行完整的 134 个任务 × 4 repeats，不再把一个小评测集切成四份。
 12 个 checkpoint 会组成 3 个 wave。checkpoint 数必须能被 `EVAL_GPUS` 整除，以免最后一个

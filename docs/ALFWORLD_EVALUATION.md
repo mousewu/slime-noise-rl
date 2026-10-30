@@ -32,8 +32,10 @@ ALFWORLD_EVAL_CHECKPOINTS_TSV=configs/alfworld_eval_checkpoints.tsv \
 ALFWORLD_EVAL_OUTPUT=runs/alfworld-noise-eval-main \
 EVAL_GPUS=4 \
 EVAL_REPEATS=4 \
-EVAL_CONCURRENCY_PER_GPU=96 \
-EVAL_ENVIRONMENT_PROCESSES_PER_GPU=32 \
+EVAL_CONCURRENCY_PER_GPU=64 \
+EVAL_ENVIRONMENT_PROCESSES_PER_GPU=16 \
+EVAL_HEARTBEAT_INTERVAL_SECONDS=30 \
+SGLANG_STALL_TIMEOUT_SECONDS=600 \
 SGLANG_MEM_FRACTION_STATIC=0.80 \
 GPU_UTILIZATION_MIN=70 \
 bash scripts/evaluate_alfworld_noise_matrix.sh
@@ -45,10 +47,17 @@ bash scripts/evaluate_alfworld_noise_matrix.sh
 wave 留下空闲 GPU。模型加载阶段不计入脚本的条件利用率。每个 checkpoint/噪声条件都有
 独立的 `gpu-utilization.json`；平均值低于门槛时脚本保留已完成结果并停止后续测评。
 
-默认每卡推理并发为 96、环境进程为 32。若门槛未通过，可将
-`EVAL_CONCURRENCY_PER_GPU` 从 96 调到 128，但不要先大幅增加环境进程：当
+默认每卡推理并发为 64、环境进程为 16，避免 128 个 ALFWorld spawn worker 与四份模型共同
+触发主机/cgroup OOM。若门槛未通过，
+可单独将 `EVAL_CONCURRENCY_PER_GPU` 从 64 调到 96，但不要先大幅增加环境进程：当
 `environment_queue_seconds` 已很低时，它只会增加 CPU 与内存压力。只有明确接受低利用率
 继续完成矩阵时，才设置 `ALLOW_LOW_GPU_UTILIZATION=1`。
+
+评测等待期间每 30 秒向主日志打印各 checkpoint 的存活状态；如果某个 evaluator 仍在运行，
+但对应 SGLang 日志连续 600 秒没有任何进展，脚本会报告具体 checkpoint/condition、打印服务
+日志尾部并停止该 wave。可通过 `EVAL_HEARTBEAT_INTERVAL_SECONDS` 和
+`SGLANG_STALL_TIMEOUT_SECONDS` 调整。ALFWorld runner RPC 使用配置中的
+`request_timeout` 作为硬超时；超时 runner 会被终止并重建，评测清理也不会再无限等待。
 
 checkpoint 切换时，脚本会同步回收 ALFWorld 子进程，并以独立进程组关闭 SGLang 的
 launcher、scheduler 和 tokenizer workers。默认将四个 SGLang 实例的启动错开 20 秒，并在

@@ -19,8 +19,8 @@ TASK_GPU_COUNT="${EVAL_GPUS:-4}"
 TASK_REPEATS="${EVAL_REPEATS:-4}"
 TASK_SEED="${EVAL_SEED:-20261027}"
 TASK_TEMPERATURE="${EVAL_TEMPERATURE:-0.8}"
-TASK_CONCURRENCY="${EVAL_CONCURRENCY_PER_GPU:-96}"
-TASK_ENV_PROCESSES="${EVAL_ENVIRONMENT_PROCESSES_PER_GPU:-32}"
+TASK_CONCURRENCY="${EVAL_CONCURRENCY_PER_GPU:-64}"
+TASK_ENV_PROCESSES="${EVAL_ENVIRONMENT_PROCESSES_PER_GPU:-16}"
 TASK_CONTEXT="${SGLANG_CONTEXT_LENGTH:-8192}"
 TASK_MEM_FRACTION="${SGLANG_MEM_FRACTION_STATIC:-0.80}"
 TASK_HOST="${SGLANG_HOST:-127.0.0.1}"
@@ -30,6 +30,8 @@ TASK_CLEANUP_TIMEOUT="${SGLANG_CLEANUP_TIMEOUT:-30}"
 TASK_CLEANUP_PAUSE="${CHECKPOINT_CLEANUP_SECONDS:-5}"
 TASK_STARTUP_STAGGER="${SGLANG_STARTUP_STAGGER_SECONDS:-20}"
 TASK_DROP_CACHE="${SGLANG_DROP_CACHE_AFTER_LOAD:-1}"
+TASK_HEARTBEAT_INTERVAL="${EVAL_HEARTBEAT_INTERVAL_SECONDS:-30}"
+TASK_STALL_TIMEOUT="${SGLANG_STALL_TIMEOUT_SECONDS:-600}"
 TASK_UTIL_MIN="${GPU_UTILIZATION_MIN:-70}"
 TASK_UTIL_INTERVAL="${GPU_UTILIZATION_INTERVAL_SECONDS:-2}"
 TASK_ALLOW_LOW_UTIL="${ALLOW_LOW_GPU_UTILIZATION:-0}"
@@ -42,7 +44,7 @@ done
 [[ ! -e "${TASK_OUTPUT}" ]] || { echo "Refusing to reuse output directory: ${TASK_OUTPUT}" >&2; exit 2; }
 for TASK_VALUE in "${TASK_GPU_COUNT}" "${TASK_REPEATS}" "${TASK_CONCURRENCY}" \
   "${TASK_ENV_PROCESSES}" "${TASK_CONTEXT}" "${TASK_PORT_BASE}" "${TASK_STARTUP_TIMEOUT}" \
-  "${TASK_CLEANUP_TIMEOUT}"; do
+  "${TASK_CLEANUP_TIMEOUT}" "${TASK_HEARTBEAT_INTERVAL}" "${TASK_STALL_TIMEOUT}"; do
   case "${TASK_VALUE}" in ''|*[!0-9]*|0) echo "GPU count, repeats, concurrency, process count, context and ports must be positive integers" >&2; exit 2;; esac
 done
 case "${TASK_LIMIT}" in ''|*[!0-9]*) echo "EVAL_TASK_LIMIT must be a nonnegative integer" >&2; exit 2;; esac
@@ -290,12 +292,69 @@ for ((TASK_WAVE=0; TASK_WAVE<TASK_WAVE_COUNT; TASK_WAVE++)); do
       TASK_EVAL_PIDS+=("$!"); TASK_CHILD_PIDS+=("$!")
     done
 
+    # Do not disappear into a blocking wait: hosted runners commonly treat a
+    # silent parent as hung, and a dead SGLang scheduler can leave its launcher
+    # alive with HTTP requests pending forever.  Poll all evaluators, emit a
+    # heartbeat, and fail the condition when one server log stops advancing.
     TASK_FAILED=0
-    set +e
-    for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do
-      wait "${TASK_EVAL_PIDS[TASK_I]}" || TASK_FAILED=1
+    TASK_REMAINING="${TASK_GPU_COUNT}"
+    TASK_LAST_HEARTBEAT=0
+    TASK_EVAL_REAPED=()
+    for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do TASK_EVAL_REAPED+=(0); done
+    while (( TASK_REMAINING > 0 )); do
+      TASK_NOW="$(date +%s)"
+      for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do
+        (( TASK_EVAL_REAPED[TASK_I] == 0 )) || continue
+        TASK_PROC_STATE="$(awk '{print $3}' "/proc/${TASK_EVAL_PIDS[TASK_I]}/stat" 2>/dev/null || true)"
+        if ! kill -0 "${TASK_EVAL_PIDS[TASK_I]}" 2>/dev/null || [[ "${TASK_PROC_STATE}" == Z ]]; then
+          set +e
+          wait "${TASK_EVAL_PIDS[TASK_I]}"
+          TASK_EVAL_STATUS=$?
+          set -e
+          TASK_EVAL_REAPED[TASK_I]=1
+          TASK_REMAINING=$((TASK_REMAINING - 1))
+          if (( TASK_EVAL_STATUS != 0 )); then
+            TASK_FAILED=1
+            echo "Evaluation ${TASK_WAVE_LABELS[TASK_I]}/${TASK_CONDITION} exited with status ${TASK_EVAL_STATUS}" >&2
+            tail -n 120 "${TASK_WAVE_DIRS[TASK_I]}/${TASK_CONDITION}/evaluation.log" >&2 || true
+          fi
+          continue
+        fi
+
+        TASK_SERVER_LOG="${TASK_WAVE_DIRS[TASK_I]}/logs/sglang-gpu${TASK_I}.log"
+        TASK_LOG_MTIME="$(stat -c %Y "${TASK_SERVER_LOG}" 2>/dev/null || echo "${TASK_NOW}")"
+        TASK_LOG_AGE=$((TASK_NOW - TASK_LOG_MTIME))
+        if (( TASK_LOG_AGE >= TASK_STALL_TIMEOUT )); then
+          TASK_FAILED=1
+          echo "SGLang stall: ${TASK_WAVE_LABELS[TASK_I]}/${TASK_CONDITION} has an active evaluator but no server-log progress for ${TASK_LOG_AGE}s" >&2
+          tail -n 120 "${TASK_SERVER_LOG}" >&2 || true
+          kill "${TASK_EVAL_PIDS[TASK_I]}" 2>/dev/null || true
+        fi
+      done
+
+      if (( TASK_NOW - TASK_LAST_HEARTBEAT >= TASK_HEARTBEAT_INTERVAL )); then
+        echo "Evaluation heartbeat: wave=$((TASK_WAVE + 1))/${TASK_WAVE_COUNT} condition=${TASK_CONDITION} remaining=${TASK_REMAINING}"
+        for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do
+          TASK_EVAL_LOG="${TASK_WAVE_DIRS[TASK_I]}/${TASK_CONDITION}/evaluation.log"
+          TASK_EVAL_BYTES="$(wc -c <"${TASK_EVAL_LOG}" 2>/dev/null || echo 0)"
+          echo "  gpu=${TASK_GPU_IDS[TASK_I]} model=${TASK_WAVE_LABELS[TASK_I]} reaped=${TASK_EVAL_REAPED[TASK_I]} eval_log_bytes=${TASK_EVAL_BYTES}"
+        done
+        TASK_LAST_HEARTBEAT="${TASK_NOW}"
+      fi
+      (( TASK_REMAINING == 0 )) || sleep 2
     done
-    set -e
+
+    # Reap any evaluator terminated by the stall watchdog.
+    for ((TASK_I=0; TASK_I<TASK_GPU_COUNT; TASK_I++)); do
+      if (( TASK_EVAL_REAPED[TASK_I] == 0 )); then
+        set +e
+        wait "${TASK_EVAL_PIDS[TASK_I]}"
+        TASK_EVAL_STATUS=$?
+        set -e
+        TASK_EVAL_REAPED[TASK_I]=1
+        (( TASK_EVAL_STATUS == 0 )) || TASK_FAILED=1
+      fi
+    done
     kill "${TASK_MONITOR_PID}" 2>/dev/null || true
     wait "${TASK_MONITOR_PID}" 2>/dev/null || true
     TASK_CHILD_PIDS=()

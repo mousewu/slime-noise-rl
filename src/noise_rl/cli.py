@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import logging
 import os
 from dataclasses import replace
 from pathlib import Path
@@ -20,6 +21,8 @@ from .environment_runners import shutdown_process_environment_pools
 from .fixtures import ByteTokenizer, ScriptedClient
 from .metrics import balanced_variance_components, episode_record, paired_comparison, summarize
 from .sampling import plan_sample
+
+LOGGER = logging.getLogger(__name__)
 
 
 def load_episode_records(path):
@@ -118,16 +121,29 @@ async def run_evaluation(args):
             )
             return episode_record(trajectory, plan, config, checkpoint=args.model)
 
+    evaluation_error = None
     try:
         output = await asyncio.gather(
             *(one(i, r, rank) for i, r in indexed_records for rank in range(args.repeats))
         )
+    except BaseException as exc:
+        evaluation_error = exc
+        LOGGER.exception("Evaluation failed before environment cleanup: %s", exc)
+        raise
     finally:
         await client.close()
         # Evaluation runs are short-lived subprocesses.  Reap every TextWorld
         # child before the parent exits so a checkpoint matrix cannot
         # accumulate ALFWorld runners across conditions.
-        await asyncio.to_thread(shutdown_process_environment_pools)
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(shutdown_process_environment_pools), timeout=30
+            )
+        except TimeoutError:
+            LOGGER.error(
+                "Timed out after 30s while reaping ALFWorld runner pools%s",
+                " after evaluation error" if evaluation_error is not None else "",
+            )
     write_records(args.output, output)
     report = summarize(output)
     atomic_json(str(args.output) + ".summary.json", report)

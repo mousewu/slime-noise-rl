@@ -13,13 +13,18 @@ import atexit
 import multiprocessing as mp
 import os
 import uuid
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+)
+from concurrent.futures import (
+    TimeoutError as FutureTimeoutError,
+)
 from dataclasses import dataclass, field
 from queue import Queue
 from threading import Lock
 
 from .envs import StepResult, make_environment
-
 
 # These globals exist only in a runner child process.  Environment instances
 # are never serialized back to the rollout worker.
@@ -101,16 +106,36 @@ class ProcessIsolatedALFWorldEnvironment:
         return self._slot.executor.submit(function, self._episode_id, *args)
 
     async def _await(self, function, *args):
-        return await asyncio.wrap_future(self._submit(function, *args))
+        future = self._submit(function, *args)
+        try:
+            return await asyncio.wait_for(
+                asyncio.wrap_future(future), timeout=self._pool.rpc_timeout
+            )
+        except TimeoutError as exc:
+            self._release(force_recycle=True)
+            raise TimeoutError(
+                f"ALFWorld runner {self.runner_index} timed out after "
+                f"{self._pool.rpc_timeout}s in {function.__name__}"
+            ) from exc
 
     async def acreate(self) -> None:
         await self._await(_runner_create, self._pool.task_for(self._episode_id))
 
     def reset(self) -> StepResult:
-        return self._submit(_runner_reset).result()
+        return self._result(_runner_reset)
 
     def step(self, action: str) -> StepResult:
-        return self._submit(_runner_step, action).result()
+        return self._result(_runner_step, action)
+
+    def _result(self, function, *args):
+        try:
+            return self._submit(function, *args).result(timeout=self._pool.rpc_timeout)
+        except FutureTimeoutError as exc:
+            self._release(force_recycle=True)
+            raise TimeoutError(
+                f"ALFWorld runner {self.runner_index} timed out after "
+                f"{self._pool.rpc_timeout}s in {function.__name__}"
+            ) from exc
 
     def is_read_only(self, action: str) -> bool:
         # This is the exact ALFWorld implementation rule.  Keeping it in the
@@ -122,7 +147,7 @@ class ProcessIsolatedALFWorldEnvironment:
             return
         force_recycle = False
         try:
-            self._submit(_runner_close).result()
+            self._result(_runner_close)
         except BaseException:
             force_recycle = True
             raise
@@ -158,13 +183,18 @@ class ProcessEnvironmentPool:
     until ``close`` returns it to the pool.
     """
 
-    def __init__(self, processes: int, recycle_episodes: int = 32):
+    def __init__(
+        self, processes: int, recycle_episodes: int = 32, rpc_timeout: float = 180.0
+    ):
         if type(processes) is not int or processes < 1:
             raise ValueError("processes must be a positive integer")
         if type(recycle_episodes) is not int or recycle_episodes < 0:
             raise ValueError("recycle_episodes must be a nonnegative integer")
+        if type(rpc_timeout) not in {int, float} or rpc_timeout <= 0:
+            raise ValueError("rpc_timeout must be positive")
         self.processes = processes
         self.recycle_episodes = recycle_episodes
+        self.rpc_timeout = float(rpc_timeout)
         context = mp.get_context("spawn")
         self._mp_context = context
         self._slots = tuple(
@@ -253,12 +283,12 @@ class ProcessEnvironmentPool:
             if recycled:
                 self._restarts_total += 1
         if old_executor is not None:
-            old_executor.shutdown(wait=False, cancel_futures=True)
+            _terminate_executor(old_executor)
         if self._closed:
             # The replacement is unused when the parent is already shutting
             # down.  Do not put the slot back into a pool nobody can acquire.
             if recycled:
-                slot.executor.shutdown(wait=False, cancel_futures=True)
+                _terminate_executor(slot.executor)
             return recycled
         self._available.put(slot)
         return recycled
@@ -281,22 +311,45 @@ class ProcessEnvironmentPool:
         # method.  Waiting here is intentional: wait=False lets spawn children
         # outlive a short evaluator process and repeated matrix conditions can
         # then exhaust host memory.
-        self._wait_executor.shutdown(wait=True, cancel_futures=True)
+        self._wait_executor.shutdown(wait=False, cancel_futures=True)
         for slot in self._slots:
-            slot.executor.shutdown(wait=True, cancel_futures=True)
+            _terminate_executor(slot.executor)
 
 
-_POOLS: dict[tuple[int, int], ProcessEnvironmentPool] = {}
+def _terminate_executor(executor: ProcessPoolExecutor) -> None:
+    """Stop a runner without waiting forever for a wedged native backend.
+
+    ProcessPoolExecutor has no public bounded-shutdown API.  Snapshotting its
+    worker processes before shutdown lets us terminate a child stuck inside
+    TextWorld and prevents interpreter finalizers from masking the original
+    rollout exception.
+    """
+    processes = tuple(getattr(executor, "_processes", {}).values())
+    executor.shutdown(wait=False, cancel_futures=True)
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    for process in processes:
+        process.join(timeout=2)
+    for process in processes:
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=2)
+
+
+_POOLS: dict[tuple[int, int, float], ProcessEnvironmentPool] = {}
 _POOLS_LOCK = Lock()
 
 
-def get_process_environment_pool(processes: int, recycle_episodes: int = 32) -> ProcessEnvironmentPool:
+def get_process_environment_pool(
+    processes: int, recycle_episodes: int = 32, rpc_timeout: float = 180.0
+) -> ProcessEnvironmentPool:
     """Return a rollout-worker-local pool with the requested fixed capacity."""
-    key = (processes, recycle_episodes)
+    key = (processes, recycle_episodes, float(rpc_timeout))
     with _POOLS_LOCK:
         pool = _POOLS.get(key)
         if pool is None:
-            pool = ProcessEnvironmentPool(processes, recycle_episodes)
+            pool = ProcessEnvironmentPool(processes, recycle_episodes, rpc_timeout)
             _POOLS[key] = pool
         return pool
 

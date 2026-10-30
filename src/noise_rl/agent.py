@@ -19,7 +19,6 @@ from .noise import NoisyEnvironment, execute_with_retry
 from .rollout_diagnostics import weight_update_snapshot
 from .sampling import SamplingPlan, stable_seed
 
-
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You control a text household environment. Complete the task using its commands.
@@ -173,7 +172,9 @@ async def create_episode_environment(
         and environment_factory is make_environment
     ):
         return await get_process_environment_pool(
-            config.environment_processes, config.environment_recycle_episodes
+            config.environment_processes,
+            config.environment_recycle_episodes,
+            config.request_timeout,
         ).open(task)
     loop = asyncio.get_running_loop()
     environment = await loop.run_in_executor(

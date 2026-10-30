@@ -3,8 +3,9 @@ import json
 import logging
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -21,8 +22,11 @@ from noise_rl.agent import (
     run_episode,
 )
 from noise_rl.config import ExperimentConfig, NoiseConfig
+from noise_rl.environment_runners import (
+    ProcessEnvironmentPool,
+    ProcessIsolatedALFWorldEnvironment,
+)
 from noise_rl.envs import ALFWorldEnvironment, StepResult
-from noise_rl.environment_runners import ProcessEnvironmentPool
 from noise_rl.fixtures import ByteTokenizer, ScriptedClient
 from noise_rl.noise import NoisyEnvironment
 from noise_rl.sampling import plan_sample
@@ -227,6 +231,28 @@ def test_process_runner_recycles_only_after_a_closed_lease():
     assert statistics["completed_leases_total"] == 1
     assert statistics["restarts_total"] == 1
     assert not second_recycled
+
+
+def test_process_runner_rpc_timeout_releases_and_recycles_slot():
+    releases = []
+
+    class Pool:
+        rpc_timeout = 0.01
+
+        def release(self, slot, episode_id, *, force_recycle=False):
+            releases.append((slot.index, episode_id, force_recycle))
+            return True
+
+    environment = ProcessIsolatedALFWorldEnvironment(
+        Pool(), SimpleNamespace(index=7), "episode-1"
+    )
+    environment._submit = lambda *_args: Future()
+
+    with pytest.raises(TimeoutError, match=r"runner 7.*_runner_reset"):
+        environment.reset()
+
+    assert releases == [(7, "episode-1", True)]
+    assert environment.recycled_on_release
 
 
 def test_special_tokens_in_observation_are_escaped():
